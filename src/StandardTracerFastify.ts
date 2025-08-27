@@ -12,19 +12,20 @@ import {
   ATTR_HTTP_RESPONSE_STATUS_CODE,
   ATTR_URL_PATH,
 } from "@opentelemetry/semantic-conventions";
-import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
+import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 const propagator = new W3CTraceContextPropagator();
 
 export function StandardTracerFastifyRegisterHooks(
   fastify: FastifyInstance,
   standardTracer: StandardTracer,
-  standardLogger: StandardLogger
+  standardLogger: StandardLogger,
+  options?: StandardTracerFastifyRegisterHooksOptions
 ): void {
   const logger = standardLogger.createModuleLogger("Fastify");
 
   fastify.addHook("onRequest", async (req: FastifyRequest) => {
-    if (req.url.indexOf("/api") !== 0) {
+    if (!req.url.startsWith(options?.rootApiPath || "/api")) {
       return;
     }
 
@@ -69,4 +70,13 @@ export function StandardTracerFastifyRegisterHooks(
       logger.error(error);
     }
   );
+}
+
+export interface StandardTracerFastifyRegisterHooksOptions {
+  rootApiPath?: string;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function OTelRequestSpan(req: any): Span {
+  return req.tracerSpanApi;
 }
