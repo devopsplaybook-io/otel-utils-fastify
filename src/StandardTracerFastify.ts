@@ -32,6 +32,9 @@ export function StandardTracerFastifyRegisterHooks(
       return;
     }
     const spanName = `${req.method}-${req.url.split("?")[0]}`;
+    if (options?.ignoreList?.includes(spanName)) {
+      return;
+    }
     const callerContext = propagator.extract(
       ROOT_CONTEXT,
       req.headers,
@@ -75,6 +78,7 @@ export function StandardTracerFastifyRegisterHooks(
 
 export interface StandardTracerFastifyRegisterHooksOptions {
   rootApiPath?: string;
+  ignoreList?: string[];
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
