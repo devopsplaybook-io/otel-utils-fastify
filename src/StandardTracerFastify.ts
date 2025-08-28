@@ -25,7 +25,10 @@ export function StandardTracerFastifyRegisterHooks(
   const logger = standardLogger.createModuleLogger("Fastify");
 
   fastify.addHook("onRequest", async (req: FastifyRequest) => {
-    if (!req.url.startsWith(options?.rootApiPath || "/api")) {
+    if (
+      req.method === "OPTIONS" ||
+      !req.url.startsWith(options?.rootApiPath || "/api")
+    ) {
       return;
     }
     const spanName = `${req.method}-${req.url.split("?")[0]}`;
