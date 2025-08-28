@@ -28,9 +28,7 @@ export function StandardTracerFastifyRegisterHooks(
     if (!req.url.startsWith(options?.rootApiPath || "/api")) {
       return;
     }
-
-    const spanName = `${req.method}-${req.url}`;
-    const urlName = req.url;
+    const spanName = `${req.method}-${req.url.split("?")[0]}`;
     const callerContext = propagator.extract(
       ROOT_CONTEXT,
       req.headers,
@@ -39,7 +37,7 @@ export function StandardTracerFastifyRegisterHooks(
     api.context.with(callerContext, () => {
       const span = standardTracer.startSpan(spanName);
       span.setAttribute(ATTR_HTTP_REQUEST_METHOD, req.method);
-      span.setAttribute(ATTR_URL_PATH, urlName);
+      span.setAttribute(ATTR_URL_PATH, req.url);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (req as any).tracerSpanApi = span;
     });
