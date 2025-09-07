@@ -52,8 +52,10 @@ export function StandardTracerFastifyRegisterHooks(
   fastify.addHook(
     "onResponse",
     async (req: FastifyRequest, reply: FastifyReply) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const span = (req as any).tracerSpanApi as Span;
+      const span = OTelRequestSpan(req);
+      if (!span) {
+        return;
+      }
       if (reply.statusCode > 299) {
         span.status.code = SpanStatusCode.ERROR;
       } else {
@@ -67,11 +69,13 @@ export function StandardTracerFastifyRegisterHooks(
   fastify.addHook(
     "onError",
     async (req: FastifyRequest, reply: FastifyReply, error) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const span = (req as any).tracerSpanApi as Span;
+      const span = OTelRequestSpan(req);
+      if (!span) {
+        return;
+      }
       span.status.code = SpanStatusCode.ERROR;
       span.recordException(error);
-      logger.error(error);
+      logger.error(error.message, error, span);
     }
   );
 }
