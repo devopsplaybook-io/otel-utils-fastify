@@ -1,6 +1,6 @@
 {
   "name": "@devopsplaybook.io/otel-utils-fastify",
-  "version": "1.0.18",
+  "version": "1.0.19",
   "description": "Utility to simplify integration with Open Telemetry for Fastify API Server",
   "keywords": [
     "Open Telemetry",
@@ -19,7 +19,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "fastify": "^5.8.4",
+    "fastify": "^5.8.5",
     "@devopsplaybook.io/otel-utils": "^1.0.17"
   },
   "devDependencies": {
@@ -28,7 +28,7 @@
     "@types/sqlite3": "^5.1.0",
     "ts-node": "^10.9.2",
     "typescript-eslint": "^8.58.2",
-    "typescript": "^6.0.2"
+    "typescript": "^6.0.3"
   },
   "publishConfig": {
     "access": "public"
