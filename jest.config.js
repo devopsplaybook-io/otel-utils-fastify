@@ -9,5 +9,6 @@ module.exports = {
     ],
   },
   testMatch: ["/**/src/**/*.spec.(ts|js)"],
+  testPathIgnorePatterns: ["/node_modules/", "/dist/"],
   testEnvironment: "node",
 };
