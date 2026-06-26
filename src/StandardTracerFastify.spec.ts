@@ -40,11 +40,11 @@ function buildApp(options?: StandardTracerFastifyRegisterHooksOptions) {
 
   const app = Fastify();
 
-  app.get("/api/test", async (_req, _res) => ({ ok: true }));
+  app.get("/api/test", async () => ({ ok: true }));
   app.get("/api/status", async (_req, res) =>
     res.status(400).send({ error: "bad" }),
   );
-  app.get("/api/error-test", async (_req, _res) => {
+  app.get("/api/error-test", async () => {
     throw new Error("test error");
   });
   app.get("/api/echo", async (req, res) => {
@@ -55,13 +55,15 @@ function buildApp(options?: StandardTracerFastifyRegisterHooksOptions) {
     const span = OTelRequestSpan(req);
     return res.send({ hasSpan: !!span });
   });
-  app.get("/api/pub/health", async (_req, _res) => ({ ok: true }));
-  app.get("/api/pub/metrics", async (_req, _res) => ({ ok: true }));
-  app.get("/api/health", async (_req, _res) => ({ ok: true }));
+  app.get("/api/pub/health", async () => ({ ok: true }));
+  app.get("/api/pub/metrics", async () => ({ ok: true }));
+  app.get("/api/health", async () => ({ ok: true }));
 
   StandardTracerFastifyRegisterHooks(
     app,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     mockTracer as any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     mockLogger as any,
     options,
   );
@@ -92,7 +94,7 @@ describe("request filtering", () => {
 
   test("traces requests inside rootApiPath", async () => {
     const { app, mockTracer } = buildApp({ rootApiPath: "/api/v2" });
-    app.get("/api/v2/data", async (_req, _res) => ({ ok: true }));
+    app.get("/api/v2/data", async () => ({ ok: true }));
     await app.inject({ method: "GET", url: "/api/v2/data" });
     expect(mockTracer.startSpan).toHaveBeenCalledWith("GET-/api/v2/data");
   });
