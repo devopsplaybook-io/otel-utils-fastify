@@ -2,12 +2,15 @@ module.exports = {
   moduleFileExtensions: ["ts", "js"],
   transform: {
     "^.+\\.(ts|tsx)$": [
-      "ts-jest",
+      "@swc/jest",
       {
-        tsconfig: "tsconfig.spec.json",
+        jsc: {
+          target: "es2019",
+        },
       },
     ],
   },
+  coverageProvider: "v8",
   testMatch: ["/**/src/**/*.spec.(ts|js)"],
   testPathIgnorePatterns: ["/node_modules/", "/dist/"],
   testEnvironment: "node",

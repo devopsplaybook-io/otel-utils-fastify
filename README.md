@@ -122,5 +122,5 @@ The span is stored in a `WeakMap` rather than as a property on the request objec
 ## Build
 
 ```bash
-npm run build   # tsc → dist/
+npm run build   # tsc → dist/, then type-checks the spec files (tsc --noEmit)
 ```

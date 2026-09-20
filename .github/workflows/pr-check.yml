@@ -20,5 +20,6 @@ jobs:
     uses: devopsplaybook-io/common-utils/.github/workflows/reusable-npm-pr.yml@main
     with:
       npm_package_name: "@devopsplaybook.io/otel-utils-fastify"
+      node_version: "22"
     secrets:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
