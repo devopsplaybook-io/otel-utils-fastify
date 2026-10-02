@@ -1,6 +1,6 @@
 import Fastify, { FastifyInstance } from "fastify";
 import http from "node:http";
-import { AddressInfo } from "node:net";
+import net, { AddressInfo } from "node:net";
 import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
 import {
   StandardTracerFastifyRegisterHooks,
@@ -36,10 +36,24 @@ function createMockLogger() {
   };
 }
 
+function createMockMeter() {
+  const histogram = { record: jest.fn() };
+  return {
+    createHistogram: jest.fn().mockReturnValue(histogram),
+    histogram,
+  };
+}
+
+interface BuildAppOverrides {
+  tracer?: unknown;
+  logger?: unknown;
+}
+
 /** Build a Fastify app with hooks registered and a few test routes. */
 function buildApp(
   options?: StandardTracerFastifyRegisterHooksOptions,
   fastifyOptions?: { connectionTimeout?: number },
+  overrides?: BuildAppOverrides,
 ) {
   const mockSpan = createMockSpan();
   const mockTracer = createMockTracer(mockSpan);
@@ -51,11 +65,35 @@ function buildApp(
   app.get("/api/status", async (_req, res) =>
     res.status(400).send({ error: "bad" }),
   );
+  app.get("/api/server-error", async (_req, res) =>
+    res.status(500).send({ error: "boom" }),
+  );
   app.get("/api/error-test", async () => {
     throw new Error("test error");
   });
   app.get("/api/throw-string", async () => {
     throw "string error";
+  });
+  app.get("/api/forbidden", async () => {
+    throw Object.assign(new Error("forbidden"), { statusCode: 403 });
+  });
+  app.get("/api/unavailable", async () => {
+    throw Object.assign(new Error("unavailable"), { statusCode: 503 });
+  });
+  app.get("/api/validation-error", async () => {
+    throw Object.assign(new Error("validation failed"), {
+      code: "FST_ERR_VALIDATION",
+      statusCode: 400,
+    });
+  });
+  app.get("/api/custom-name-error", async () => {
+    throw Object.assign(new Error("custom failure"), { name: "CustomError" });
+  });
+  app.get("/api/empty-name-error", async () => {
+    throw Object.assign(new Error("empty name"), { name: "", code: "MY_CODE" });
+  });
+  app.get("/api/empty-code-error", async () => {
+    throw Object.assign(new Error("empty code"), { name: "", code: "" });
   });
   app.get("/api/hang", async () => new Promise(() => {}));
   app.get("/api/files/:id", async () => ({ ok: true }));
@@ -85,9 +123,9 @@ function buildApp(
   StandardTracerFastifyRegisterHooks(
     app,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockTracer as any,
+    (overrides?.tracer ?? mockTracer) as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    mockLogger as any,
+    (overrides?.logger ?? mockLogger) as any,
     options,
   );
 
@@ -263,6 +301,41 @@ describe("request filtering", () => {
       { kind: SpanKind.SERVER },
     );
   });
+
+  test("traces absolute-form request targets", async () => {
+    const { app, mockTracer, mockSpan } = buildApp();
+    const port = await listen(app);
+    try {
+      const response = await new Promise<string>((resolve) => {
+        const socket = net.connect(port, "127.0.0.1", () => {
+          socket.write(
+            "GET http://example.com/api/abs HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+          );
+        });
+        let data = "";
+        socket.on("data", (chunk) => {
+          data += chunk.toString();
+        });
+        socket.on("close", () => resolve(data));
+        socket.on("error", () => resolve(data));
+      });
+      expect(response.split("\r\n")[0]).toContain("404");
+      await waitFor(() => {
+        expect(mockSpan.end).toHaveBeenCalledTimes(1);
+      });
+      expect(mockTracer.startSpan).toHaveBeenCalledWith(
+        "GET-/api/abs",
+        undefined,
+        { kind: SpanKind.SERVER },
+      );
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        "url.path",
+        "/api/abs",
+      );
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -355,12 +428,10 @@ describe("span lifecycle", () => {
     expect(mockSpan.setAttribute).toHaveBeenCalledWith("url.path", "/api/test");
   });
 
-  test("sets status and ends span on success response", async () => {
+  test("leaves span status unset and ends span on success response", async () => {
     const { app, mockSpan } = buildApp();
     await app.inject({ method: "GET", url: "/api/test" });
-    expect(mockSpan.setStatus).toHaveBeenCalledWith({
-      code: SpanStatusCode.OK,
-    });
+    expect(mockSpan.setStatus).not.toHaveBeenCalled();
     expect(mockSpan.setAttribute).toHaveBeenCalledWith(
       "http.response.status_code",
       200,
@@ -368,12 +439,52 @@ describe("span lifecycle", () => {
     expect(mockSpan.end).toHaveBeenCalledTimes(1);
   });
 
-  test("sets ERROR status on 4xx response", async () => {
+  test("leaves span status unset on 4xx response", async () => {
     const { app, mockSpan } = buildApp();
     await app.inject({ method: "GET", url: "/api/status" });
+    expect(mockSpan.setStatus).not.toHaveBeenCalled();
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.response.status_code",
+      400,
+    );
+    expect(mockSpan.end).toHaveBeenCalledTimes(1);
+  });
+
+  test("sets ERROR status on 5xx response", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({ method: "GET", url: "/api/server-error" });
     expect(mockSpan.setStatus).toHaveBeenCalledWith({
       code: SpanStatusCode.ERROR,
     });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.response.status_code",
+      500,
+    );
+    expect(mockSpan.end).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps the recorded error when the error handler answers 2xx", async () => {
+    const { app, mockSpan, mockLogger } = buildApp();
+    app.setErrorHandler((_error, _req, reply) => {
+      reply.status(200).send({ swallowed: true });
+    });
+    const res = await app.inject({ method: "GET", url: "/api/error-test" });
+    expect(res.statusCode).toBe(200);
+    expect(mockSpan.setStatus).toHaveBeenCalledWith({
+      code: SpanStatusCode.ERROR,
+    });
+    expect(mockSpan.setStatus).not.toHaveBeenCalledWith({
+      code: SpanStatusCode.OK,
+    });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("error.type", "Error");
+    expect(mockSpan.recordException).toHaveBeenCalledWith(expect.any(Error));
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.response.status_code",
+      200,
+    );
+    expect(mockSpan.end).toHaveBeenCalledTimes(1);
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.error).toHaveBeenCalledTimes(1);
   });
 
   test("records exception on handler error", async () => {
@@ -411,6 +522,57 @@ describe("span lifecycle", () => {
       expect.any(Error),
       expect.any(Object),
     );
+    expect(moduleLogger.warn).not.toHaveBeenCalled();
+  });
+
+  test("logs 4xx client errors at warn level without the error object", async () => {
+    const { app, mockLogger, mockSpan } = buildApp();
+    await app.inject({ method: "GET", url: "/api/forbidden" });
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledWith("forbidden", mockSpan);
+    expect(moduleLogger.error).not.toHaveBeenCalled();
+  });
+
+  test("logs errors with a 5xx statusCode at error level", async () => {
+    const { app, mockLogger } = buildApp();
+    await app.inject({ method: "GET", url: "/api/unavailable" });
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.error).toHaveBeenCalledWith(
+      "unavailable",
+      expect.any(Error),
+      expect.any(Object),
+    );
+    expect(moduleLogger.warn).not.toHaveBeenCalled();
+  });
+
+  test("uses error.code as error.type for Fastify-generated errors", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({ method: "GET", url: "/api/validation-error" });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "error.type",
+      "FST_ERR_VALIDATION",
+    );
+  });
+
+  test("uses a specific error name as error.type when not generic", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({ method: "GET", url: "/api/custom-name-error" });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "error.type",
+      "CustomError",
+    );
+  });
+
+  test("falls back to error.code when the error name is empty", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({ method: "GET", url: "/api/empty-name-error" });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("error.type", "MY_CODE");
+  });
+
+  test("falls back to Error when name and code are empty", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({ method: "GET", url: "/api/empty-code-error" });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("error.type", "Error");
   });
 
   test("does not log when the erroring request is not traced", async () => {
@@ -522,6 +684,339 @@ describe("registration guard", () => {
       undefined,
       { kind: SpanKind.SERVER },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fail-open hooks (A2)
+// ---------------------------------------------------------------------------
+
+describe("fail-open hooks", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test("serves requests untraced and warns once when the tracer throws", async () => {
+    const mockLogger = createMockLogger();
+    const { app } = buildApp(undefined, undefined, {
+      tracer: {
+        startSpan: jest.fn(() => {
+          throw "tracer exploded";
+        }),
+      },
+      logger: mockLogger,
+    });
+
+    const res1 = await app.inject({ method: "GET", url: "/api/test" });
+    const res2 = await app.inject({ method: "GET", url: "/api/test" });
+    expect(res1.statusCode).toBe(200);
+    expect(res2.statusCode).toBe(200);
+
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("tracer exploded");
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("onRequest");
+  });
+
+  test("serves requests untraced when span operations throw", async () => {
+    const throwingSpan = {
+      setAttribute: jest.fn(() => {
+        throw new Error("span exploded");
+      }),
+      setStatus: jest.fn(() => {
+        throw new Error("span exploded");
+      }),
+      end: jest.fn(() => {
+        throw new Error("span exploded");
+      }),
+      recordException: jest.fn(() => {
+        throw new Error("span exploded");
+      }),
+    };
+    const { app, mockLogger } = buildApp(undefined, undefined, {
+      tracer: { startSpan: jest.fn().mockReturnValue(throwingSpan) },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/test" });
+    expect(res.statusCode).toBe(200);
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("span exploded");
+  });
+
+  test("serves requests when the logger itself throws", async () => {
+    const throwingLogger = {
+      createModuleLogger: jest.fn().mockReturnValue({
+        info: jest.fn(),
+        warn: jest.fn(() => {
+          throw new Error("logger exploded");
+        }),
+        error: jest.fn(),
+      }),
+    };
+    const { app } = buildApp(undefined, undefined, {
+      tracer: {
+        startSpan: jest.fn(() => {
+          throw new Error("tracer exploded");
+        }),
+      },
+      logger: throwingLogger,
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/test" });
+    expect(res.statusCode).toBe(200);
+    const moduleLogger =
+      throwingLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps the response when span.end throws on response", async () => {
+    const span = createMockSpan();
+    span.end.mockImplementation(() => {
+      throw new Error("end exploded");
+    });
+    const { app, mockLogger } = buildApp(undefined, undefined, {
+      tracer: { startSpan: jest.fn().mockReturnValue(span) },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/test" });
+    expect(res.statusCode).toBe(200);
+    expect(span.end).toHaveBeenCalledTimes(1);
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("end exploded");
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("onResponse");
+  });
+
+  test("keeps the response when span.setStatus throws in onError", async () => {
+    const span = createMockSpan();
+    span.setStatus.mockImplementation(() => {
+      throw new Error("status exploded");
+    });
+    const { app, mockLogger } = buildApp(undefined, undefined, {
+      tracer: { startSpan: jest.fn().mockReturnValue(span) },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/error-test" });
+    expect(res.statusCode).toBe(500);
+    expect(span.end).toHaveBeenCalledTimes(1);
+    expect(span.setAttribute).toHaveBeenCalledWith(
+      "http.response.status_code",
+      500,
+    );
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("status exploded");
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("onError");
+  });
+
+  test("warns and ends the span when the abort hook fails", async () => {
+    const span = createMockSpan();
+    span.setStatus.mockImplementation(() => {
+      throw new Error("abort exploded");
+    });
+    const { app, mockLogger } = buildApp(undefined, undefined, {
+      tracer: { startSpan: jest.fn().mockReturnValue(span) },
+    });
+    const port = await listen(app);
+    try {
+      await new Promise<void>((resolve) => {
+        const req = http.get(
+          { host: "127.0.0.1", port, path: "/api/hang" },
+          () => resolve(),
+        );
+        req.on("error", () => resolve());
+        setTimeout(() => {
+          req.destroy();
+          resolve();
+        }, 100);
+      });
+      await waitFor(() => {
+        expect(span.end).toHaveBeenCalledTimes(1);
+      });
+      const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+      expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+      expect(moduleLogger.warn.mock.calls[0][0]).toContain("abort exploded");
+    } finally {
+      await app.close();
+    }
+  });
+
+  test("warns and ends the span when the timeout hook fails", async () => {
+    const span = createMockSpan();
+    span.setStatus.mockImplementation(() => {
+      throw new Error("timeout exploded");
+    });
+    const { app, mockLogger } = buildApp(
+      undefined,
+      { connectionTimeout: 150 },
+      { tracer: { startSpan: jest.fn().mockReturnValue(span) } },
+    );
+    const port = await listen(app);
+    try {
+      const client = http.get({ host: "127.0.0.1", port, path: "/api/hang" });
+      client.on("error", () => {});
+      await waitFor(() => {
+        expect(span.end).toHaveBeenCalledTimes(1);
+      });
+      const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+      expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+      expect(moduleLogger.warn.mock.calls[0][0]).toContain("timeout exploded");
+      client.destroy();
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// unmatchedRouteSpanName option (B1)
+// ---------------------------------------------------------------------------
+
+describe("unmatchedRouteSpanName option", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test("uses the method as span name for unmatched routes when set to method", async () => {
+    const { app, mockTracer, mockSpan } = buildApp({
+      unmatchedRouteSpanName: "method",
+    });
+    const res = await app.inject({ method: "GET", url: "/api/unknown/42" });
+    expect(res.statusCode).toBe(404);
+    expect(mockTracer.startSpan).toHaveBeenCalledWith("GET", undefined, {
+      kind: SpanKind.SERVER,
+    });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "url.path",
+      "/api/unknown/42",
+    );
+    expect(mockSpan.setAttribute).not.toHaveBeenCalledWith(
+      "http.route",
+      expect.anything(),
+    );
+  });
+
+  test("uses the request method for unmatched non-GET requests", async () => {
+    const { app, mockTracer } = buildApp({
+      unmatchedRouteSpanName: "method",
+    });
+    await app.inject({ method: "POST", url: "/api/unknown" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith("POST", undefined, {
+      kind: SpanKind.SERVER,
+    });
+  });
+
+  test("keeps the route template for matched routes with method policy", async () => {
+    const { app, mockTracer } = buildApp({
+      unmatchedRouteSpanName: "method",
+    });
+    await app.inject({ method: "GET", url: "/api/files/123" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "GET-/api/files/_id",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+  });
+
+  test("keeps the path fallback by default", async () => {
+    const { app, mockTracer } = buildApp();
+    await app.inject({ method: "GET", url: "/api/unknown/42" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "GET-/api/unknown/42",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// standardMeter option (B2)
+// ---------------------------------------------------------------------------
+
+describe("standardMeter option", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test("records the request duration histogram with method, route and status", async () => {
+    const meter = createMockMeter();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { app } = buildApp({ standardMeter: meter as any });
+
+    await app.inject({ method: "GET", url: "/api/test" });
+
+    expect(meter.createHistogram).toHaveBeenCalledWith(
+      "http.server.request.duration",
+    );
+    expect(meter.histogram.record).toHaveBeenCalledTimes(1);
+    const [value, attributes] = meter.histogram.record.mock.calls[0];
+    expect(typeof value).toBe("number");
+    expect(value).toBeGreaterThanOrEqual(0);
+    expect(attributes).toEqual({
+      "http.request.method": "GET",
+      "http.route": "/api/test",
+      "http.response.status_code": 200,
+    });
+  });
+
+  test("omits http.route for unmatched routes", async () => {
+    const meter = createMockMeter();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { app } = buildApp({ standardMeter: meter as any });
+
+    await app.inject({ method: "GET", url: "/api/unknown/42" });
+
+    expect(meter.histogram.record).toHaveBeenCalledTimes(1);
+    const [, attributes] = meter.histogram.record.mock.calls[0];
+    expect(attributes).toEqual({
+      "http.request.method": "GET",
+      "http.response.status_code": 404,
+    });
+  });
+
+  test("does not record for ignored requests", async () => {
+    const meter = createMockMeter();
+    const { app } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      standardMeter: meter as any,
+      ignoreList: ["GET-/api/test"],
+    });
+
+    await app.inject({ method: "GET", url: "/api/test" });
+
+    expect(meter.histogram.record).not.toHaveBeenCalled();
+  });
+
+  test("records error.type instead of a status code on client abort", async () => {
+    const meter = createMockMeter();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { app } = buildApp({ standardMeter: meter as any });
+    const port = await listen(app);
+    try {
+      await new Promise<void>((resolve) => {
+        const req = http.get(
+          { host: "127.0.0.1", port, path: "/api/hang" },
+          () => resolve(),
+        );
+        req.on("error", () => resolve());
+        setTimeout(() => {
+          req.destroy();
+          resolve();
+        }, 100);
+      });
+      await waitFor(() => {
+        expect(meter.histogram.record).toHaveBeenCalledTimes(1);
+      });
+      const [, attributes] = meter.histogram.record.mock.calls[0];
+      expect(attributes).toEqual({
+        "http.request.method": "GET",
+        "http.route": "/api/hang",
+        "error.type": "client_abort",
+      });
+    } finally {
+      await app.close();
+    }
   });
 });
 
