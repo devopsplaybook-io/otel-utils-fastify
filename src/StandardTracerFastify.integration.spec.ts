@@ -142,7 +142,8 @@ describe("request span correlation", () => {
     expect(httpSpan!.attributes["url.path"]).toBe("/api/files/123");
     expect(httpSpan!.attributes["http.route"]).toBe("/api/files/:id");
     expect(httpSpan!.attributes["http.response.status_code"]).toBe(200);
-    expect(httpSpan!.status.code).toBe(SpanStatusCode.OK);
+    // Span status is left unset for 1xx-4xx per the HTTP semantic conventions.
+    expect(httpSpan!.status.code).toBe(SpanStatusCode.UNSET);
     expect(httpSpan!.parentSpanContext).toBeUndefined();
 
     const contextChild = spans.find((s) => s.name === "handler-child-context");
@@ -185,6 +186,51 @@ describe("request span correlation", () => {
         httpSpan!.spanContext().spanId,
       );
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error handling (A1)
+// ---------------------------------------------------------------------------
+
+describe("error handling", () => {
+  test("keeps the error disposition when a custom error handler answers 2xx", async () => {
+    const app = Fastify();
+    registerHooks(app);
+    app.get("/api/swallow", async () => {
+      throw new Error("swallowed failure");
+    });
+    app.setErrorHandler((_error, _req, reply) => {
+      reply.status(200).send({ swallowed: true });
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/swallow" });
+    expect(res.statusCode).toBe(200);
+
+    const spans = exporter.getFinishedSpans();
+    const span = spans.find((s) => s.name === "GET-/api/swallow");
+    expect(span).toBeDefined();
+    expect(span!.status.code).toBe(SpanStatusCode.ERROR);
+    expect(span!.attributes["error.type"]).toBe("Error");
+    expect(span!.attributes["http.response.status_code"]).toBe(200);
+    expect(span!.events.some((event) => event.name === "exception")).toBe(true);
+  });
+
+  test("leaves the span status unset on a 4xx response", async () => {
+    const app = Fastify();
+    registerHooks(app);
+    app.get("/api/teapot", async (_req, reply) =>
+      reply.status(418).send({ error: "teapot" }),
+    );
+
+    const res = await app.inject({ method: "GET", url: "/api/teapot" });
+    expect(res.statusCode).toBe(418);
+
+    const spans = exporter.getFinishedSpans();
+    const span = spans.find((s) => s.name === "GET-/api/teapot");
+    expect(span).toBeDefined();
+    expect(span!.status.code).toBe(SpanStatusCode.UNSET);
+    expect(span!.attributes["http.response.status_code"]).toBe(418);
   });
 });
 
