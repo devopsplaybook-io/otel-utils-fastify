@@ -10,9 +10,10 @@ import {
 import {
   InMemorySpanExporter,
   SimpleSpanProcessor,
-  Span,
-} from "@opentelemetry/sdk-trace-base";
-import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+  type Span,
+  TracerProvider,
+} from "@opentelemetry/sdk-trace";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import type {
   StandardLogger,
   StandardTracer,
@@ -32,12 +33,16 @@ const CALLER_SPAN_ID = "b7ad6b7169203331";
 const TRACEPARENT = `00-${CALLER_TRACE_ID}-${CALLER_SPAN_ID}-01`;
 
 const exporter = new InMemorySpanExporter();
-const provider = new NodeTracerProvider({
-  spanProcessors: [new SimpleSpanProcessor(exporter)],
+const provider = new TracerProvider({
+  spanProcessors: [new SimpleSpanProcessor({ exporter })],
 });
-// Registers the global tracer provider and an AsyncLocalStorageContextManager,
-// so `context.with(...)` and the parent resolution below behave as in production.
-provider.register();
+// OTel v3 removed register(): install the global tracer provider and an
+// AsyncLocalStorageContextManager explicitly, so `context.with(...)` and the
+// parent resolution below behave as in production.
+trace.setGlobalTracerProvider(provider);
+otelContext.setGlobalContextManager(
+  new AsyncLocalStorageContextManager().enable(),
+);
 const sdkTracer = provider.getTracer("otel-utils-fastify-integration");
 
 /**
