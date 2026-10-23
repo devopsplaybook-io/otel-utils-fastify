@@ -1,6 +1,6 @@
 {
   "name": "@devopsplaybook.io/otel-utils-fastify",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Utility to simplify integration with Open Telemetry for Fastify API Server",
   "keywords": [
     "Open Telemetry",
@@ -10,7 +10,10 @@
     "Metrics"
   ],
   "license": "ISC",
-  "author": "",
+  "author": "Didier Hoarau",
+  "repository": "git+https://github.com/devopsplaybook-io/otel-utils-fastify.git",
+  "homepage": "https://github.com/devopsplaybook-io/otel-utils-fastify#readme",
+  "bugs": "https://github.com/devopsplaybook-io/otel-utils-fastify/issues",
   "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

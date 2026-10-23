@@ -50,8 +50,9 @@ StandardTracerFastifyRegisterHooks(fastify, tracer, logger, {
   ignoreListSuffix: ["/metrics", "/health"],
   // Optional: record the http.server.request.duration histogram
   standardMeter: meter,
-  // Optional: keep span-name cardinality bounded for unmatched routes (404s)
-  // unmatchedRouteSpanName: "method",
+  // Recommended: keep span-name cardinality bounded for unmatched routes (404s)
+  // from scanner/probe traffic. "path" remains the default for compatibility.
+  unmatchedRouteSpanName: "method",
 });
 
 // In route handlers, retrieve the current span for manual instrumentation
@@ -78,6 +79,8 @@ fastify.get("/api/files", async (req, res) => {
   });
 });
 ```
+
+> **Production tip:** set `unmatchedRouteSpanName: "method"` to keep span-name cardinality bounded when scanners and probes hit unmatched routes (404s) with arbitrary paths; `"path"` remains the default for backward compatibility. The full request path is always kept in `url.path`.
 
 ## Exported API
 
@@ -140,11 +143,15 @@ The query string is not recorded (`url.query` is not set).
 
 `server.address` and `server.port` are derived from the client-controlled `Host` header — or from `X-Forwarded-Host` when Fastify `trustProxy` is enabled and the connecting peer is trusted — so they are only as trustworthy as the deployment's proxy configuration. Arbitrary `Host` values also become attribute values: if inbound host names are not constrained by a proxy or load balancer, that introduces cardinality. 1.5.0 has no configured server-address override.
 
+### Span status: returned vs thrown 4xx
+
+Span status follows the OTel HTTP semantic conventions for **returned** responses: **unset for 1xx–4xx** and **ERROR for 5xx**. **Thrown** errors are intentionally different: `onError` always sets ERROR and records `error.type` and the exception, even when Fastify turns the thrown error into a 4xx response (for example a validation error producing a 400). An exception is treated as an error regardless of the status code it produces, whereas a deliberately returned 4xx response is not a server error. This asymmetry is intentional; do not report it as a bug.
+
 ### Metrics: `http.server.request.duration`
 
-When a [`StandardMeter`](https://github.com/devopsplaybookio/otel-utils) is passed in `standardMeter`, the hooks record one histogram observation per traced request at span end:
+When a [`StandardMeter`](https://github.com/devopsplaybook-io/otel-utils) is passed in `standardMeter`, the hooks record one histogram observation per traced request at span end:
 
-- Name: `http.server.request.duration` (seconds). `StandardMeter` prefixes the service id, so it is exported as `<SERVICE_ID>.http.server.request.duration`.
+- Name: `http.server.request.duration` (values in **seconds**), with two deliberate deviations from the OTel semantic conventions: `StandardMeter` prefixes the service id, so the metric is exported as `<SERVICE_ID>.http.server.request.duration` instead of `http.server.request.duration`, and the histogram is created without a unit, so backends do not see the semconv unit `s`. Both are kept unchanged for compatibility (renaming or adding a unit is a behaviour change). The future opt-in is `createHistogram(name, { unprefixed: true })`, available in the otel-utils 1.5.x line (verified with the locked 1.5.3), which would export the exact semconv name; forwarding a unit (`{ unit: "s" }`) requires otel-utils >= 1.7.0, which adds `MetricOptions` support. Neither option is used by this package today.
 - Attributes: `http.request.method` (normalized to `_OTHER` for unknown methods), the required `url.scheme`, the recommended `network.protocol.version`, `http.route` (only when a route matched) and `http.response.status_code` — or `error.type` (`client_abort` / `timeout`) instead of a status code for aborted/timed-out requests.
 - Returned 5xx responses also carry `error.type`: the status code as a string (e.g. `"500"`), or the specific value recorded by `onError` (`FST_ERR_VALIDATION`, the error name, ...) when an exception was thrown. A specific thrown-error value is never replaced by the status code.
 - Deliberately **not** recorded on the metric: `http.request.method_original` (bounded cardinality) and `server.address` / `server.port` (semconv opt-in), so the metric attributes stay low-cardinality.
@@ -201,7 +208,11 @@ fastify.get("/api/files/:id", async (req, res) => {
 
 ### Deprecated: `req.tracerSpanApi`
 
-The span is also assigned to `req.tracerSpanApi` as a deprecated compatibility alias. **Deprecated in favor of `OTelRequestSpan(req)`**: it keeps working for the whole 1.x line and is **planned for removal in 2.0.0**, only after the known consumers (`common-utils`, `kubernetes-web-lightclient`) have migrated to `OTelRequestSpan(req)`. New code must use `OTelRequestSpan(req)`.
+The span is also assigned to `req.tracerSpanApi` as a deprecated compatibility alias. **Deprecated in favor of `OTelRequestSpan(req)`**: it keeps working for the whole 1.x line and is **removed in 2.0.0**. New code must use `OTelRequestSpan(req)`.
+
+The two known consumers migrated to `OTelRequestSpan(req)` on 2026-10-02 (`common-utils` PR #27 and `kubernetes-web-lightclient` PR #45). No maintained consumer is expected to read the alias: the `cloudcost` copy (`cloudcost-server/src/OTelContext.ts`) is a dead local shim that nothing imports, and `telepathy` uses the exported hooks and `StandardTracer` without the alias.
+
+**2.0.0 removal criterion:** before the 2.0.0 release, a code search of the `devopsplaybook-io` organization must return no maintained code reading `req.tracerSpanApi` outside this repository (the dead `cloudcost` shim must be deleted or migrated), and the alias is then removed from this package. Until then it stays available but deprecated.
 
 ## Architecture
 
@@ -226,6 +237,15 @@ onResponse / onError / onRequestAbort / onTimeout
 ```
 
 The span and context are stored in `WeakMap`s rather than as properties on the request object, avoiding type pollution and allowing natural garbage collection. The `tracerSpanApi` alias is set to `undefined` when the span ends (it is a plain property, so it must be cleaned up explicitly).
+
+## Documentation changes in 1.7.0
+
+- Refreshed the `req.tracerSpanApi` deprecation note: both known consumers migrated on 2026-10-02, no maintained consumer remains, concrete 2.0.0 removal criterion.
+- Fixed the `StandardMeter` link (wrong GitHub organization).
+- Documented the intentional span-status asymmetry for thrown 4xx responses and the metric deviations (`<SERVICE_ID>.` prefix, no unit `s`).
+- Recommended `unmatchedRouteSpanName: "method"` in the quick start; `"path"` remains the default.
+- Added `repository`, `homepage`, `bugs` and `author` metadata to `package.json`.
+- No runtime behaviour change.
 
 ## Behavior changes in 1.6.0
 
