@@ -16,6 +16,7 @@ import {
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import type {
   StandardLogger,
+  StandardMeter,
   StandardTracer,
 } from "@devopsplaybook.io/otel-utils";
 import {
@@ -75,12 +76,28 @@ const testLogger = {
   }),
 };
 
-function registerHooks(app: FastifyInstance): void {
+function registerHooks(app: FastifyInstance, meter?: StandardMeter): void {
   StandardTracerFastifyRegisterHooks(
     app,
     testTracer as unknown as StandardTracer,
     testLogger as unknown as StandardLogger,
+    meter ? { standardMeter: meter } : undefined,
   );
+}
+
+function createRecordingMeter() {
+  const observations: Array<{
+    value: number;
+    attributes: Record<string, unknown>;
+  }> = [];
+  const meter = {
+    createHistogram: () => ({
+      record: (value: number, attributes: Record<string, unknown>) => {
+        observations.push({ value, attributes });
+      },
+    }),
+  };
+  return { meter: meter as unknown as StandardMeter, observations };
 }
 
 async function waitFor(assertion: () => void, timeoutMs = 3000) {
@@ -236,6 +253,124 @@ describe("error handling", () => {
     expect(span).toBeDefined();
     expect(span!.status.code).toBe(SpanStatusCode.UNSET);
     expect(span!.attributes["http.response.status_code"]).toBe(418);
+    expect(span!.attributes["error.type"]).toBeUndefined();
+  });
+
+  test("records error.type on a returned 5xx response", async () => {
+    const { meter, observations } = createRecordingMeter();
+    const app = Fastify();
+    registerHooks(app, meter);
+    app.get("/api/server-error", async (_req, reply) =>
+      reply.status(500).send({ error: "boom" }),
+    );
+
+    const res = await app.inject({ method: "GET", url: "/api/server-error" });
+    expect(res.statusCode).toBe(500);
+
+    const span = exporter
+      .getFinishedSpans()
+      .find((s) => s.name === "GET-/api/server-error");
+    expect(span).toBeDefined();
+    expect(span!.status.code).toBe(SpanStatusCode.ERROR);
+    expect(span!.attributes["http.response.status_code"]).toBe(500);
+    expect(span!.attributes["error.type"]).toBe("500");
+    expect(observations).toHaveLength(1);
+    expect(observations[0].attributes["error.type"]).toBe("500");
+    expect(observations[0].attributes["http.response.status_code"]).toBe(500);
+  });
+
+  test("keeps the specific error.type on a thrown 5xx response", async () => {
+    const { meter, observations } = createRecordingMeter();
+    const app = Fastify();
+    registerHooks(app, meter);
+    app.get("/api/boom", async () => {
+      throw new Error("boom");
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/boom" });
+    expect(res.statusCode).toBe(500);
+
+    const span = exporter
+      .getFinishedSpans()
+      .find((s) => s.name === "GET-/api/boom");
+    expect(span).toBeDefined();
+    expect(span!.status.code).toBe(SpanStatusCode.ERROR);
+    expect(span!.attributes["error.type"]).toBe("Error");
+    expect(observations).toHaveLength(1);
+    expect(observations[0].attributes["error.type"]).toBe("Error");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HTTP server span attributes (M2, L4)
+// ---------------------------------------------------------------------------
+
+describe("HTTP server span attributes", () => {
+  test("records url.scheme, server.address, server.port and network.protocol.version", async () => {
+    const app = Fastify();
+    registerHooks(app);
+    app.get("/api/files/:id", async () => ({ ok: true }));
+
+    const res = await app.inject({ method: "GET", url: "/api/files/1" });
+    expect(res.statusCode).toBe(200);
+
+    const span = exporter
+      .getFinishedSpans()
+      .find((s) => s.name === "GET-/api/files/_id");
+    expect(span).toBeDefined();
+    expect(span!.attributes["url.scheme"]).toBe("http");
+    expect(span!.attributes["server.address"]).toBe("localhost");
+    expect(span!.attributes["server.port"]).toBe(80);
+    expect(span!.attributes["network.protocol.version"]).toBe("1.1");
+  });
+
+  test("honours trustProxy for url.scheme, server.address and server.port", async () => {
+    const app = Fastify({ trustProxy: true });
+    registerHooks(app);
+    app.get("/api/test", async () => ({ ok: true }));
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/test",
+      headers: {
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "api.example.com:8443",
+      },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const span = exporter
+      .getFinishedSpans()
+      .find((s) => s.name === "GET-/api/test");
+    expect(span).toBeDefined();
+    expect(span!.attributes["url.scheme"]).toBe("https");
+    expect(span!.attributes["server.address"]).toBe("api.example.com");
+    expect(span!.attributes["server.port"]).toBe(8443);
+  });
+
+  test("normalizes an unknown method to _OTHER in the span name and attributes", async () => {
+    const app = Fastify();
+    registerHooks(app);
+    app.get("/api/files/:id", async () => ({ ok: true }));
+
+    const res = await app.inject({
+      // PROPFIND is a valid IANA method outside Fastify's HTTPMethods union.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      method: "PROPFIND" as any,
+      url: "/api/files/123",
+    });
+    expect(res.statusCode).toBe(404);
+
+    const span = exporter
+      .getFinishedSpans()
+      .find((s) => s.name === "_OTHER-/api/files/123");
+    expect(span).toBeDefined();
+    expect(span!.attributes["http.request.method"]).toBe("_OTHER");
+    expect(span!.attributes["http.request.method_original"]).toBe("PROPFIND");
+    // The verbatim method must never leak into the span name.
+    expect(
+      exporter.getFinishedSpans().some((s) => s.name.includes("PROPFIND")),
+    ).toBe(false);
   });
 });
 
