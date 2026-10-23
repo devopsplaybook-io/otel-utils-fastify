@@ -841,6 +841,83 @@ describe("registration guard", () => {
       { kind: SpanKind.SERVER },
     );
   });
+
+  test("ignores a second registration on an encapsulated child instance", async () => {
+    const { app, mockSpan, mockTracer } = buildApp();
+    const childSpan = createMockSpan();
+    const childTracer = createMockTracer(childSpan);
+    const childLogger = createMockLogger();
+
+    app.register(async (child) => {
+      StandardTracerFastifyRegisterHooks(
+        child,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        childTracer as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        childLogger as any,
+      );
+      child.get("/api/child", async () => ({ ok: true }));
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/child" });
+    expect(res.statusCode).toBe(200);
+    expect(mockTracer.startSpan).toHaveBeenCalledTimes(1);
+    expect(childTracer.startSpan).not.toHaveBeenCalled();
+    expect(mockSpan.end).toHaveBeenCalledTimes(1);
+    expect(childSpan.end).not.toHaveBeenCalled();
+    const childModuleLogger =
+      childLogger.createModuleLogger.mock.results[0].value;
+    expect(childModuleLogger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  test("instruments once when a child registration precedes the root one", async () => {
+    const rootSpan = createMockSpan();
+    const rootTracer = createMockTracer(rootSpan);
+    const childSpan = createMockSpan();
+    const childTracer = createMockTracer(childSpan);
+    const mockLogger = createMockLogger();
+
+    const app = Fastify();
+    app.register(async (child) => {
+      StandardTracerFastifyRegisterHooks(
+        child,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        childTracer as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        mockLogger as any,
+      );
+      child.get("/api/child", async () => ({ ok: true }));
+    });
+    app.after(() => {
+      StandardTracerFastifyRegisterHooks(
+        app,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        rootTracer as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        mockLogger as any,
+      );
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/child" });
+    expect(res.statusCode).toBe(200);
+    expect(childTracer.startSpan).toHaveBeenCalledTimes(1);
+    expect(rootTracer.startSpan).not.toHaveBeenCalled();
+    expect(childSpan.end).toHaveBeenCalledTimes(1);
+    expect(rootSpan.end).not.toHaveBeenCalled();
+  });
+
+  test("registers independently on distinct root instances", async () => {
+    const first = buildApp();
+    const second = buildApp();
+
+    await first.app.inject({ method: "GET", url: "/api/test" });
+    await second.app.inject({ method: "GET", url: "/api/test" });
+
+    expect(first.mockTracer.startSpan).toHaveBeenCalledTimes(1);
+    expect(first.mockSpan.end).toHaveBeenCalledTimes(1);
+    expect(second.mockTracer.startSpan).toHaveBeenCalledTimes(1);
+    expect(second.mockSpan.end).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -924,6 +1001,45 @@ describe("fail-open hooks", () => {
     const moduleLogger =
       throwingLogger.createModuleLogger.mock.results[0].value;
     expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+  });
+
+  test("ends the created span when onRequest setup throws after span creation", async () => {
+    const span = createMockSpan();
+    span.setAttribute.mockImplementation(() => {
+      throw new Error("attribute exploded");
+    });
+    const { app, mockLogger } = buildApp(undefined, undefined, {
+      tracer: { startSpan: jest.fn().mockReturnValue(span) },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/test" });
+    expect(res.statusCode).toBe(200);
+    expect(span.end).toHaveBeenCalledTimes(1);
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("attribute exploded");
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("onRequest");
+  });
+
+  test("keeps the request when span.end also throws in the onRequest catch", async () => {
+    const span = createMockSpan();
+    span.setAttribute.mockImplementation(() => {
+      throw new Error("attribute exploded");
+    });
+    span.end.mockImplementation(() => {
+      throw new Error("end exploded");
+    });
+    const { app, mockLogger } = buildApp(undefined, undefined, {
+      tracer: { startSpan: jest.fn().mockReturnValue(span) },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/test" });
+    expect(res.statusCode).toBe(200);
+    expect(span.end).toHaveBeenCalledTimes(1);
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("attribute exploded");
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("onRequest");
   });
 
   test("keeps the response when span.end throws on response", async () => {

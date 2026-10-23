@@ -431,3 +431,47 @@ describe("span ending on abort and timeout", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Encapsulated duplicate registration (M3)
+// ---------------------------------------------------------------------------
+
+describe("encapsulated duplicate registration", () => {
+  test("instruments a request once when the hooks are also registered on a child instance", async () => {
+    const startedSpanNames: string[] = [];
+    const countingTracer = {
+      startSpan: (
+        name: string,
+        parentSpan?: Span,
+        options?: { kind?: SpanKind },
+      ): Span => {
+        startedSpanNames.push(name);
+        return testTracer.startSpan(name, parentSpan, options);
+      },
+    };
+
+    const app = Fastify();
+    StandardTracerFastifyRegisterHooks(
+      app,
+      countingTracer as unknown as StandardTracer,
+      testLogger as unknown as StandardLogger,
+    );
+    app.register(async (child) => {
+      StandardTracerFastifyRegisterHooks(
+        child,
+        countingTracer as unknown as StandardTracer,
+        testLogger as unknown as StandardLogger,
+      );
+      child.get("/api/child", async () => ({ ok: true }));
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/child" });
+    expect(res.statusCode).toBe(200);
+    expect(startedSpanNames).toEqual(["GET-/api/child"]);
+
+    const spans = exporter.getFinishedSpans();
+    expect(spans).toHaveLength(1);
+    expect(spans[0].name).toBe("GET-/api/child");
+    expect(spans[0].attributes["http.response.status_code"]).toBe(200);
+  });
+});

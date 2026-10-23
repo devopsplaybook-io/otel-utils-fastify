@@ -93,9 +93,9 @@ Registers five Fastify hooks:
 | `onRequestAbort` | Ends the span with ERROR status and `error.type = "client_abort"` when the client aborts the request.                                                                                                                                                                                                                                                                                                                                                |
 | `onTimeout`      | Ends the span with ERROR status and `error.type = "timeout"` when the connection times out.                                                                                                                                                                                                                                                                                                                                                          |
 
-Registration is idempotent per Fastify instance: a second registration on the same instance is ignored with a warning. Hooks are registered globally and cannot be removed — register them **once**, at the root of the Fastify instance.
+Registration is idempotent across the instance tree: a second registration on the same instance **or on an encapsulated child of an already-registered instance** is ignored with a warning. The internal `otelUtilsFastifyHooksRegistered` decorator marks a registered instance and is inherited by encapsulated children; a child registered before its root cannot be detected at registration time and is additionally neutralized per request, so a request is never instrumented twice. Hooks are registered globally and cannot be removed — register them **once**, at the root of the Fastify instance.
 
-Tracing is **fail-open**: a fault in any hook (including a throwing tracer, span or logger) is caught, logged once at warn level through the `ModuleLogger`, and the request continues untraced — instrumentation never fails the request.
+Tracing is **fail-open**: a fault in any hook (including a throwing tracer, span or logger) is caught, logged once at warn level through the `ModuleLogger`, and the request continues untraced — instrumentation never fails the request. If `onRequest` fails after the span was created, the span is ended (best effort) before the request continues untraced, so it is not leaked.
 
 **Options:**
 
@@ -226,6 +226,12 @@ onResponse / onError / onRequestAbort / onTimeout
 ```
 
 The span and context are stored in `WeakMap`s rather than as properties on the request object, avoiding type pollution and allowing natural garbage collection. The `tracerSpanApi` alias is set to `undefined` when the span ends (it is a plain property, so it must be cleaned up explicitly).
+
+## Behavior changes in 1.6.0
+
+- **Duplicate registration across encapsulation no longer double-instruments**: registering the hooks at the root and again inside `fastify.register()` is detected (inherited `otelUtilsFastifyHooksRegistered` decorator) and ignored with a warning; a child registered before the root is neutralized per request. One span is created and ended per request instead of a leaked first span.
+- **`onRequest` setup failures no longer leak spans**: a span created before a failure in the hook (e.g. a throwing `setAttribute`) is ended best effort before the request continues untraced.
+- No new metric, no dependency change, additive and non-breaking — hence a minor version bump.
 
 ## Behavior changes in 1.5.0
 

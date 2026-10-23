@@ -57,6 +57,9 @@ const requestContexts = new WeakMap<FastifyRequest, Context>();
 const requestStartTimes = new WeakMap<FastifyRequest, bigint>();
 const requestErrorTypes = new WeakMap<FastifyRequest, string>();
 const registeredFastifyInstances = new WeakSet<FastifyInstance>();
+// Decorators are inherited by encapsulated child instances, so the marker
+// detects a registration made on any ancestor of the current instance.
+const REGISTERED_DECORATOR_NAME = "otelUtilsFastifyHooksRegistered";
 
 type FastifyRequestWithSpanAlias = FastifyRequest & { tracerSpanApi?: Span };
 
@@ -145,13 +148,18 @@ export interface StandardTracerFastifyRegisterHooksOptions {
  * - Logs errors via the provided {@link StandardLogger} with trace context;
  *   client errors (`statusCode < 500`) are logged at warn level.
  * - Tracing is fail-open: a fault in any hook is caught, logged once at warn
- *   level and the request continues untraced.
+ *   level and the request continues untraced. A span created before an
+ *   `onRequest` setup failure is ended (best effort) so it is not leaked.
  * - Skips OPTIONS requests and requests outside the configured `rootApiPath`.
  * - Additional filtering via `ignoreList` (exact), `ignoreListPrefix`, `ignoreListSuffix`
  *   — checked in that order with short-circuit evaluation.
  *
  * Register the hooks **once**, at the root of the Fastify instance: a second
- * registration on the same instance is ignored (with a warning), and hooks
+ * registration on the same instance or on an encapsulated child of an
+ * already-registered instance is ignored with a warning (detected through the
+ * inherited `otelUtilsFastifyHooksRegistered` decorator). A child registered
+ * before its root cannot be detected at registration time and is additionally
+ * neutralized per request, so a request is never instrumented twice. Hooks
  * registered inside an encapsulated plugin only see the requests routed
  * through that plugin scope.
  *
@@ -172,12 +180,16 @@ export function StandardTracerFastifyRegisterHooks(
 ): void {
   const logger = standardLogger.createModuleLogger("Fastify");
 
-  if (registeredFastifyInstances.has(fastify)) {
+  if (
+    registeredFastifyInstances.has(fastify) ||
+    fastify.hasDecorator(REGISTERED_DECORATOR_NAME)
+  ) {
     logger.warn(
-      "StandardTracerFastifyRegisterHooks is already registered on this Fastify instance: ignoring the duplicate registration.",
+      "StandardTracerFastifyRegisterHooks is already registered on this Fastify instance or an encapsulated parent instance: ignoring the duplicate registration.",
     );
     return;
   }
+  fastify.decorate(REGISTERED_DECORATOR_NAME, true);
   registeredFastifyInstances.add(fastify);
 
   const rootApiPath = normalizeRootApiPath(options?.rootApiPath);
@@ -275,7 +287,14 @@ export function StandardTracerFastifyRegisterHooks(
   };
 
   fastify.addHook("onRequest", async (req: FastifyRequest) => {
+    let span: Span | undefined;
     try {
+      // Defense in depth for a child scope registered before its root: the
+      // decorator cannot detect that ordering (decorators only flow
+      // downwards), so the first hook to run owns the request's span.
+      if (requestSpans.has(req)) {
+        return;
+      }
       if (req.method === "OPTIONS") {
         return;
       }
@@ -311,7 +330,7 @@ export function StandardTracerFastifyRegisterHooks(
       );
       // The span is created inside the extracted context so that it becomes a
       // child of the caller span when the request carries a `traceparent`.
-      const span = context.with(callerContext, () =>
+      span = context.with(callerContext, () =>
         standardTracer.startSpan(spanName, undefined, {
           kind: SpanKind.SERVER,
         }),
@@ -341,6 +360,13 @@ export function StandardTracerFastifyRegisterHooks(
       // (`req.tracerSpanApi` before 1.1.0); use OTelRequestSpan(req) instead.
       (req as FastifyRequestWithSpanAlias).tracerSpanApi = span;
     } catch (error) {
+      // End a span created before the failure; the guard keeps the hook
+      // fail-open even when span.end itself throws.
+      try {
+        span?.end();
+      } catch {
+        // Instrumentation must never affect the request.
+      }
       clearRequestState(req);
       logHookFailureOnce("onRequest", error);
     }
