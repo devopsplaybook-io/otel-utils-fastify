@@ -52,7 +52,7 @@ interface BuildAppOverrides {
 /** Build a Fastify app with hooks registered and a few test routes. */
 function buildApp(
   options?: StandardTracerFastifyRegisterHooksOptions,
-  fastifyOptions?: { connectionTimeout?: number },
+  fastifyOptions?: { connectionTimeout?: number; trustProxy?: boolean },
   overrides?: BuildAppOverrides,
 ) {
   const mockSpan = createMockSpan();
@@ -151,6 +151,18 @@ async function waitFor(assertion: () => void, timeoutMs = 3000) {
 async function listen(app: FastifyInstance): Promise<number> {
   await app.listen({ host: "127.0.0.1", port: 0 });
   return (app.server.address() as AddressInfo).port;
+}
+
+/**
+ * Injects a request with an unknown method. PROPFIND is a valid IANA method
+ * outside Fastify's `HTTPMethods` union, which only types `inject`'s method.
+ */
+function injectUnknownMethod(app: FastifyInstance, url: string) {
+  return app.inject({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    method: "PROPFIND" as any,
+    url,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -447,10 +459,14 @@ describe("span lifecycle", () => {
       "http.response.status_code",
       400,
     );
+    expect(mockSpan.setAttribute).not.toHaveBeenCalledWith(
+      "error.type",
+      expect.anything(),
+    );
     expect(mockSpan.end).toHaveBeenCalledTimes(1);
   });
 
-  test("sets ERROR status on 5xx response", async () => {
+  test("sets ERROR status and error.type on 5xx response", async () => {
     const { app, mockSpan } = buildApp();
     await app.inject({ method: "GET", url: "/api/server-error" });
     expect(mockSpan.setStatus).toHaveBeenCalledWith({
@@ -460,7 +476,15 @@ describe("span lifecycle", () => {
       "http.response.status_code",
       500,
     );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("error.type", "500");
     expect(mockSpan.end).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps the specific error.type on a thrown 5xx response", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({ method: "GET", url: "/api/error-test" });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("error.type", "Error");
+    expect(mockSpan.setAttribute).not.toHaveBeenCalledWith("error.type", "500");
   });
 
   test("keeps the recorded error when the error handler answers 2xx", async () => {
@@ -584,6 +608,138 @@ describe("span lifecycle", () => {
     expect(mockTracer.startSpan).not.toHaveBeenCalled();
     const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
     expect(moduleLogger.error).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HTTP server attributes (M2)
+// ---------------------------------------------------------------------------
+
+describe("HTTP server span attributes", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test("records url.scheme, server.address, server.port and network.protocol.version", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({
+      method: "GET",
+      url: "/api/test",
+      headers: { host: "example.com:8080" },
+    });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("url.scheme", "http");
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "server.address",
+      "example.com",
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("server.port", 8080);
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "network.protocol.version",
+      "1.1",
+    );
+  });
+
+  test("honours trustProxy for url.scheme, server.address and server.port", async () => {
+    const { app, mockSpan } = buildApp(undefined, { trustProxy: true });
+    await app.inject({
+      method: "GET",
+      url: "/api/test",
+      headers: {
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "api.example.com:8443",
+      },
+    });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("url.scheme", "https");
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "server.address",
+      "api.example.com",
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("server.port", 8443);
+  });
+
+  test("omits server.address and server.port for an HTTP/1.0 request without Host", async () => {
+    const { app, mockSpan } = buildApp();
+    const port = await listen(app);
+    try {
+      const response = await new Promise<string>((resolve) => {
+        const socket = net.connect(port, "127.0.0.1", () => {
+          socket.write("GET /api/test HTTP/1.0\r\n\r\n");
+        });
+        let data = "";
+        socket.on("data", (chunk) => {
+          data += chunk.toString();
+        });
+        socket.on("close", () => resolve(data));
+        socket.on("error", () => resolve(data));
+      });
+      expect(response.split("\r\n")[0]).toContain("200");
+      await waitFor(() => {
+        expect(mockSpan.end).toHaveBeenCalledTimes(1);
+      });
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith("url.scheme", "http");
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        "network.protocol.version",
+        "1.0",
+      );
+      expect(mockSpan.setAttribute).not.toHaveBeenCalledWith(
+        "server.address",
+        expect.anything(),
+      );
+      expect(mockSpan.setAttribute).not.toHaveBeenCalledWith(
+        "server.port",
+        expect.anything(),
+      );
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HTTP method normalization (L4)
+// ---------------------------------------------------------------------------
+
+describe("HTTP method normalization", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test("normalizes an unknown method to _OTHER and records the original", async () => {
+    const { app, mockTracer, mockSpan } = buildApp();
+    const res = await injectUnknownMethod(app, "/api/test");
+    expect(res.statusCode).toBe(404);
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "_OTHER-/api/test",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.request.method",
+      "_OTHER",
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.request.method_original",
+      "PROPFIND",
+    );
+  });
+
+  test("uses _OTHER as the span name for unmatched requests with the method policy", async () => {
+    const { app, mockTracer } = buildApp({
+      unmatchedRouteSpanName: "method",
+    });
+    await injectUnknownMethod(app, "/api/unknown");
+    expect(mockTracer.startSpan).toHaveBeenCalledWith("_OTHER", undefined, {
+      kind: SpanKind.SERVER,
+    });
+  });
+
+  test("does not record http.request.method_original for known methods", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({ method: "GET", url: "/api/test" });
+    expect(mockSpan.setAttribute).not.toHaveBeenCalledWith(
+      "http.request.method_original",
+      expect.anything(),
+    );
   });
 });
 
@@ -955,6 +1111,8 @@ describe("standardMeter option", () => {
     expect(value).toBeGreaterThanOrEqual(0);
     expect(attributes).toEqual({
       "http.request.method": "GET",
+      "url.scheme": "http",
+      "network.protocol.version": "1.1",
       "http.route": "/api/test",
       "http.response.status_code": 200,
     });
@@ -971,6 +1129,81 @@ describe("standardMeter option", () => {
     const [, attributes] = meter.histogram.record.mock.calls[0];
     expect(attributes).toEqual({
       "http.request.method": "GET",
+      "url.scheme": "http",
+      "network.protocol.version": "1.1",
+      "http.response.status_code": 404,
+    });
+  });
+
+  test("records error.type on a returned 5xx response", async () => {
+    const meter = createMockMeter();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { app } = buildApp({ standardMeter: meter as any });
+
+    await app.inject({ method: "GET", url: "/api/server-error" });
+
+    expect(meter.histogram.record).toHaveBeenCalledTimes(1);
+    const [, attributes] = meter.histogram.record.mock.calls[0];
+    expect(attributes).toEqual({
+      "http.request.method": "GET",
+      "url.scheme": "http",
+      "network.protocol.version": "1.1",
+      "http.route": "/api/server-error",
+      "http.response.status_code": 500,
+      "error.type": "500",
+    });
+  });
+
+  test("keeps the specific error.type on a thrown 5xx response", async () => {
+    const meter = createMockMeter();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { app } = buildApp({ standardMeter: meter as any });
+
+    await app.inject({ method: "GET", url: "/api/error-test" });
+
+    expect(meter.histogram.record).toHaveBeenCalledTimes(1);
+    const [, attributes] = meter.histogram.record.mock.calls[0];
+    expect(attributes).toEqual({
+      "http.request.method": "GET",
+      "url.scheme": "http",
+      "network.protocol.version": "1.1",
+      "http.route": "/api/error-test",
+      "http.response.status_code": 500,
+      "error.type": "Error",
+    });
+  });
+
+  test("does not record error.type on a returned 4xx response", async () => {
+    const meter = createMockMeter();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { app } = buildApp({ standardMeter: meter as any });
+
+    await app.inject({ method: "GET", url: "/api/status" });
+
+    expect(meter.histogram.record).toHaveBeenCalledTimes(1);
+    const [, attributes] = meter.histogram.record.mock.calls[0];
+    expect(attributes).toEqual({
+      "http.request.method": "GET",
+      "url.scheme": "http",
+      "network.protocol.version": "1.1",
+      "http.route": "/api/status",
+      "http.response.status_code": 400,
+    });
+  });
+
+  test("normalizes an unknown method to _OTHER without method_original", async () => {
+    const meter = createMockMeter();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { app } = buildApp({ standardMeter: meter as any });
+
+    await injectUnknownMethod(app, "/api/unknown/42");
+
+    expect(meter.histogram.record).toHaveBeenCalledTimes(1);
+    const [, attributes] = meter.histogram.record.mock.calls[0];
+    expect(attributes).toEqual({
+      "http.request.method": "_OTHER",
+      "url.scheme": "http",
+      "network.protocol.version": "1.1",
       "http.response.status_code": 404,
     });
   });
@@ -1011,6 +1244,8 @@ describe("standardMeter option", () => {
       const [, attributes] = meter.histogram.record.mock.calls[0];
       expect(attributes).toEqual({
         "http.request.method": "GET",
+        "url.scheme": "http",
+        "network.protocol.version": "1.1",
         "http.route": "/api/hang",
         "error.type": "client_abort",
       });

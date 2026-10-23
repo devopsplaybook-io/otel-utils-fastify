@@ -17,9 +17,15 @@ import type { Span } from "@opentelemetry/sdk-trace";
 import {
   ATTR_ERROR_TYPE,
   ATTR_HTTP_REQUEST_METHOD,
+  ATTR_HTTP_REQUEST_METHOD_ORIGINAL,
   ATTR_HTTP_RESPONSE_STATUS_CODE,
   ATTR_HTTP_ROUTE,
+  ATTR_NETWORK_PROTOCOL_VERSION,
+  ATTR_SERVER_ADDRESS,
+  ATTR_SERVER_PORT,
   ATTR_URL_PATH,
+  ATTR_URL_SCHEME,
+  HTTP_REQUEST_METHOD_VALUE_OTHER,
   METRIC_HTTP_SERVER_REQUEST_DURATION,
 } from "@opentelemetry/semantic-conventions";
 import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
@@ -31,10 +37,25 @@ const SPAN_NAME_SANITIZE_RE = /[^a-zA-Z0-9-_/]/g;
 const DEFAULT_ROOT_API_PATH = "/api";
 const INTERNAL_URL_BASE = "http://internal";
 
+// Known methods of the semconv `http.request.method` enum. Everything else is
+// recorded as `_OTHER` (with the verbatim method in
+// `http.request.method_original`) to keep the attribute cardinality bounded.
+const KNOWN_HTTP_METHODS = new Set([
+  "CONNECT",
+  "DELETE",
+  "GET",
+  "HEAD",
+  "OPTIONS",
+  "PATCH",
+  "POST",
+  "PUT",
+  "TRACE",
+]);
+
 const requestSpans = new WeakMap<FastifyRequest, Span>();
 const requestContexts = new WeakMap<FastifyRequest, Context>();
 const requestStartTimes = new WeakMap<FastifyRequest, bigint>();
-const requestsWithRecordedErrors = new WeakSet<FastifyRequest>();
+const requestErrorTypes = new WeakMap<FastifyRequest, string>();
 const registeredFastifyInstances = new WeakSet<FastifyInstance>();
 
 type FastifyRequestWithSpanAlias = FastifyRequest & { tracerSpanApi?: Span };
@@ -54,7 +75,8 @@ export interface StandardTracerFastifyRegisterHooksOptions {
    * Checked first, with a linear scan over the array entries.
    * Format: `"METHOD-/route"` — the same sanitized format used for span names,
    * with the route template for parameterized routes (e.g.
-   * `"GET-/api/files/_id"` for `/api/files/:id`).
+   * `"GET-/api/files/_id"` for `/api/files/:id`). Unknown methods are named
+   * `_OTHER` (e.g. `"_OTHER-/api/files/_id"`).
    */
   ignoreList?: string[];
   /**
@@ -78,7 +100,8 @@ export interface StandardTracerFastifyRegisterHooksOptions {
    *   conventions recommend a low-cardinality name when available.
    * - `"method"`: span name is the request method only (e.g. `GET`), keeping
    *   cardinality bounded. Note that `ignoreList`/`ignoreListPrefix`/
-   *   `ignoreListSuffix` then match `"GET"` for unmatched requests.
+   *   `ignoreListSuffix` then match `"GET"` for unmatched requests (or
+   *   `"_OTHER"` for unknown methods).
    *
    * The full request path is always kept in the `url.path` attribute.
    * Matched routes are unaffected.
@@ -87,9 +110,12 @@ export interface StandardTracerFastifyRegisterHooksOptions {
   /**
    * Optional {@link StandardMeter} used to record the
    * `http.server.request.duration` histogram (in seconds) for traced requests.
-   * Recorded attributes: `http.request.method`, `http.route` (only when a
-   * route matched) and `http.response.status_code` — or `error.type` instead
-   * of a status code for aborted/timed-out requests. Note that
+   * Recorded attributes: `http.request.method` (normalized to `_OTHER` for
+   * unknown methods), `url.scheme`, `network.protocol.version`, `http.route`
+   * (only when a route matched) and `http.response.status_code` — or
+   * `error.type` instead of a status code for aborted/timed-out requests.
+   * Returned 5xx responses also carry `error.type` (the status code as a
+   * string, or the specific value recorded by `onError`). Note that
    * {@link StandardMeter} prefixes the metric name with the service id, so it
    * is exported as `<SERVICE_ID>.http.server.request.duration`.
    * When omitted, no metrics are recorded.
@@ -105,11 +131,16 @@ export interface StandardTracerFastifyRegisterHooksOptions {
  * - Creates a `SpanKind.SERVER` span named `METHOD-<route>` (route template for
  *   matched routes, e.g. `GET-/api/files/_id` for `/api/files/:id`; path or
  *   method fallback when no route matched, see `unmatchedRouteSpanName`), with
- *   `http.request.method`, `url.path` (path only, no query string) and
- *   `http.route` (route template) attributes.
+ *   `http.request.method`, `http.request.method_original` (unknown methods
+ *   only), `url.path`, `url.scheme`, `server.address`, `server.port`,
+ *   `network.protocol.version` and `http.route` (route template) attributes.
+ *   Unknown HTTP methods are normalized to `_OTHER` in the span name and
+ *   `http.request.method`.
  * - Sets the span status according to the current HTTP semantic conventions for
  *   server spans: unset for 1xx-4xx responses, ERROR for 5xx responses and
  *   exceptions. A span that already recorded an error is never downgraded.
+ *   Returned 5xx responses without a recorded exception also carry
+ *   `error.type` set to the status code as a string.
  * - Ends the span on response, handler error, client abort or connection timeout.
  * - Logs errors via the provided {@link StandardLogger} with trace context;
  *   client errors (`statusCode < 500`) are logged at warn level.
@@ -177,7 +208,7 @@ export function StandardTracerFastifyRegisterHooks(
     requestSpans.delete(req);
     requestContexts.delete(req);
     requestStartTimes.delete(req);
-    requestsWithRecordedErrors.delete(req);
+    requestErrorTypes.delete(req);
     // Deprecated alias: assigning undefined avoids a V8 hidden-class
     // transition per request; the tests assert `!== undefined`.
     (req as FastifyRequestWithSpanAlias).tracerSpanApi = undefined;
@@ -191,7 +222,8 @@ export function StandardTracerFastifyRegisterHooks(
     if (!span) {
       return;
     }
-    const errorRecorded = requestsWithRecordedErrors.has(req);
+    const recordedErrorType = requestErrorTypes.get(req);
+    const errorRecorded = recordedErrorType !== undefined;
     const startTime = requestStartTimes.get(req);
     clearRequestState(req);
     try {
@@ -205,6 +237,9 @@ export function StandardTracerFastifyRegisterHooks(
         // downgraded (defense in depth; onError set ERROR already).
         if (!errorRecorded && end.statusCode >= 500) {
           span.setStatus({ code: SpanStatusCode.ERROR });
+          // Semconv: returned 5xx responses carry error.type. A specific value
+          // recorded by onError is already set and must not be overwritten.
+          span.setAttribute(ATTR_ERROR_TYPE, String(end.statusCode));
         }
         span.setAttribute(ATTR_HTTP_RESPONSE_STATUS_CODE, end.statusCode);
       }
@@ -214,7 +249,9 @@ export function StandardTracerFastifyRegisterHooks(
         const durationSeconds =
           Number(process.hrtime.bigint() - (startTime as bigint)) / 1e9;
         const attributes: Record<string, string | number> = {
-          [ATTR_HTTP_REQUEST_METHOD]: req.method,
+          [ATTR_HTTP_REQUEST_METHOD]: normalizeHttpMethod(req.method),
+          [ATTR_URL_SCHEME]: req.protocol,
+          [ATTR_NETWORK_PROTOCOL_VERSION]: req.raw.httpVersion,
         };
         const routeTemplate = req.routeOptions.url;
         if (routeTemplate) {
@@ -224,6 +261,11 @@ export function StandardTracerFastifyRegisterHooks(
           attributes[ATTR_ERROR_TYPE] = end.errorType;
         } else if (end.statusCode !== undefined) {
           attributes[ATTR_HTTP_RESPONSE_STATUS_CODE] = end.statusCode;
+          if (end.statusCode >= 500) {
+            // A specific thrown-error value wins over the status-code default.
+            attributes[ATTR_ERROR_TYPE] =
+              recordedErrorType ?? String(end.statusCode);
+          }
         }
         requestDurationHistogram.record(durationSeconds, attributes);
       }
@@ -246,13 +288,14 @@ export function StandardTracerFastifyRegisterHooks(
         return;
       }
       const routeTemplate = req.routeOptions.url;
+      const method = normalizeHttpMethod(req.method);
       let spanName: string;
       if (routeTemplate) {
-        spanName = sanitizeSpanName(`${req.method}-${routeTemplate}`);
+        spanName = sanitizeSpanName(`${method}-${routeTemplate}`);
       } else if (unmatchedRouteSpanName === "method") {
-        spanName = sanitizeSpanName(req.method);
+        spanName = sanitizeSpanName(method);
       } else {
-        spanName = sanitizeSpanName(`${req.method}-${path}`);
+        spanName = sanitizeSpanName(`${method}-${path}`);
       }
       if (
         options?.ignoreList?.includes(spanName) ||
@@ -273,8 +316,19 @@ export function StandardTracerFastifyRegisterHooks(
           kind: SpanKind.SERVER,
         }),
       );
-      span.setAttribute(ATTR_HTTP_REQUEST_METHOD, req.method);
+      span.setAttribute(ATTR_HTTP_REQUEST_METHOD, method);
+      if (method === HTTP_REQUEST_METHOD_VALUE_OTHER) {
+        span.setAttribute(ATTR_HTTP_REQUEST_METHOD_ORIGINAL, req.method);
+      }
       span.setAttribute(ATTR_URL_PATH, path);
+      span.setAttribute(ATTR_URL_SCHEME, req.protocol);
+      if (req.hostname) {
+        span.setAttribute(ATTR_SERVER_ADDRESS, req.hostname);
+      }
+      if (req.port !== null) {
+        span.setAttribute(ATTR_SERVER_PORT, req.port);
+      }
+      span.setAttribute(ATTR_NETWORK_PROTOCOL_VERSION, req.raw.httpVersion);
       if (routeTemplate) {
         span.setAttribute(ATTR_HTTP_ROUTE, routeTemplate);
       }
@@ -309,11 +363,12 @@ export function StandardTracerFastifyRegisterHooks(
       if (!span) {
         return;
       }
-      requestsWithRecordedErrors.add(req);
       const normalizedError =
         error instanceof Error ? error : new Error(String(error));
+      const errorType = getErrorType(normalizedError);
+      requestErrorTypes.set(req, errorType);
       span.setStatus({ code: SpanStatusCode.ERROR });
-      span.setAttribute(ATTR_ERROR_TYPE, getErrorType(normalizedError));
+      span.setAttribute(ATTR_ERROR_TYPE, errorType);
       span.recordException(normalizedError);
       if (isClientError(normalizedError)) {
         logger.warn(normalizedError.message, span);
@@ -349,6 +404,17 @@ function normalizeRootApiPath(rootApiPath?: string): string {
 
 function sanitizeSpanName(name: string): string {
   return name.replace(SPAN_NAME_SANITIZE_RE, "_");
+}
+
+/**
+ * Maps the request method to its `http.request.method` semconv value: known
+ * IANA methods are recorded as-is, anything else as `_OTHER` to keep the
+ * attribute (and span-name) cardinality bounded.
+ */
+function normalizeHttpMethod(method: string): string {
+  return KNOWN_HTTP_METHODS.has(method)
+    ? method
+    : HTTP_REQUEST_METHOD_VALUE_OTHER;
 }
 
 /**

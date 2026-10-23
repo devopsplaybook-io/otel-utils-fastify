@@ -1,6 +1,6 @@
 {
   "name": "@devopsplaybook.io/otel-utils-fastify",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "description": "Utility to simplify integration with Open Telemetry for Fastify API Server",
   "keywords": [
     "Open Telemetry",
