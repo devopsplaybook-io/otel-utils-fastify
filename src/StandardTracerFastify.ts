@@ -38,6 +38,14 @@ const SPAN_NAME_SANITIZE_RE = /[^a-zA-Z0-9-_/]/g;
 const DEFAULT_ROOT_API_PATH = "/api";
 const INTERNAL_URL_BASE = "http://internal";
 
+const HTTP_SERVER_REQUEST_DURATION_UNIT = "s";
+const HTTP_SERVER_REQUEST_DURATION_DESCRIPTION =
+  "Duration of HTTP server requests.";
+// OTel semconv recommended explicit bucket boundaries for
+// http.server.request.duration (seconds).
+const DEFAULT_HTTP_SERVER_REQUEST_DURATION_BUCKET_BOUNDARIES: readonly number[] =
+  [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10];
+
 // Known methods of the semconv `http.request.method` enum. Everything else is
 // recorded as `_OTHER` (with the verbatim method in
 // `http.request.method_original`) to keep the attribute cardinality bounded.
@@ -73,6 +81,25 @@ const registeredFastifyInstances = new WeakSet<FastifyInstance>();
 const REGISTERED_DECORATOR_NAME = "otelUtilsFastifyHooksRegistered";
 
 type FastifyRequestWithSpanAlias = FastifyRequest & { tracerSpanApi?: Span };
+
+/**
+ * Metadata and aggregation of the `http.server.request.duration` histogram.
+ * Defaults reproduce the OTel HTTP semantic conventions.
+ */
+export interface StandardTracerFastifyHistogramOptions {
+  /**
+   * Histogram unit. Defaults to the semconv unit `"s"`. Durations are always
+   * recorded in seconds, so overriding this only relabels the metric.
+   */
+  unit?: string;
+  /** Defaults to the semconv description `"Duration of HTTP server requests."`. */
+  description?: string;
+  /**
+   * Explicit bucket boundaries in seconds. Defaults to the semconv
+   * recommended boundaries (0.005 s … 10 s).
+   */
+  explicitBucketBoundaries?: number[];
+}
 
 /**
  * Options for {@link StandardTracerFastifyRegisterHooks}.
@@ -124,14 +151,18 @@ export interface StandardTracerFastifyRegisterHooksOptions {
   /**
    * Optional {@link StandardMeter} used to record the
    * `http.server.request.duration` histogram (in seconds) for traced requests.
+   * The histogram is created with the semconv unit `"s"`, the semconv
+   * description and the semconv recommended explicit bucket boundaries; see
+   * {@link histogramOptions} to change them.
    * Recorded attributes: `http.request.method` (normalized to `_OTHER` for
    * unknown methods), `url.scheme`, `network.protocol.version`, `http.route`
    * (only when a route matched) and `http.response.status_code` — or
    * `error.type` instead of a status code for aborted/timed-out requests.
    * Returned 5xx responses also carry `error.type` (the status code as a
    * string, or the specific value recorded by `onError`). Note that
-   * {@link StandardMeter} prefixes the metric name with the service id, so it
-   * is exported as `<SERVICE_ID>.http.server.request.duration`.
+   * {@link StandardMeter} prefixes the metric name with the service id by
+   * default, so it is exported as `<SERVICE_ID>.http.server.request.duration`;
+   * set {@link unprefixedMetricName} to export the exact semconv name.
    * When omitted, no metrics are recorded.
    *
    * Ownership across registrations: a traced request produces at most one
@@ -142,6 +173,21 @@ export interface StandardTracerFastifyRegisterHooksOptions {
    * attributed.
    */
   standardMeter?: StandardMeter;
+  /**
+   * Metadata and bucket boundaries of the `http.server.request.duration`
+   * histogram. Defaults: unit `"s"`, semconv description and semconv
+   * recommended boundaries. Only used when `standardMeter` is provided.
+   * Values are always recorded in seconds, so changing `unit` only relabels
+   * the metric.
+   */
+  histogramOptions?: StandardTracerFastifyHistogramOptions;
+  /**
+   * Export the histogram under the exact semconv name
+   * `http.server.request.duration` instead of the default
+   * `<SERVICE_ID>.http.server.request.duration`. Default `false` (the
+   * prefixed name is kept for compatibility).
+   */
+  unprefixedMetricName?: boolean;
 }
 
 /**
@@ -184,6 +230,10 @@ export interface StandardTracerFastifyRegisterHooksOptions {
  * **Telemetry ownership:** the first registration in hook execution order that
  * traces a request creates its span; the first tracing registration that has a
  * `standardMeter` supplies the `http.server.request.duration` histogram for it.
+ * The instrument is created once per registration, with unit `s`, the semconv
+ * description and the semconv recommended boundaries (see
+ * `histogramOptions`), and exported under the semconv name when
+ * `unprefixedMetricName` is set (default: `<SERVICE_ID>.…`).
  * A request traced only by registrations without a meter records no metric.
  * Hook ordering therefore never changes which span or observation a request
  * gets, and there is at most one observation per traced request.
@@ -219,8 +269,26 @@ export function StandardTracerFastifyRegisterHooks(
 
   const rootApiPath = normalizeRootApiPath(options?.rootApiPath);
   const unmatchedRouteSpanName = options?.unmatchedRouteSpanName ?? "path";
-  const requestDurationHistogram = options?.standardMeter?.createHistogram(
+  const {
+    histogramOptions,
+    standardMeter,
+    unprefixedMetricName,
+  }: StandardTracerFastifyRegisterHooksOptions = options ?? {};
+  const requestDurationHistogram = standardMeter?.createHistogram(
     METRIC_HTTP_SERVER_REQUEST_DURATION,
+    {
+      unit: histogramOptions?.unit ?? HTTP_SERVER_REQUEST_DURATION_UNIT,
+      description:
+        histogramOptions?.description ??
+        HTTP_SERVER_REQUEST_DURATION_DESCRIPTION,
+      advice: {
+        explicitBucketBoundaries: [
+          ...(histogramOptions?.explicitBucketBoundaries ??
+            DEFAULT_HTTP_SERVER_REQUEST_DURATION_BUCKET_BOUNDARIES),
+        ],
+      },
+      unprefixed: unprefixedMetricName === true,
+    },
   );
 
   // Per-registration guard against per-request log flooding when tracing fails.

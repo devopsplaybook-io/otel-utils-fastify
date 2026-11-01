@@ -3,10 +3,20 @@ import http from "node:http";
 import { AddressInfo } from "node:net";
 import {
   context as otelContext,
+  type MetricOptions,
   SpanKind,
   SpanStatusCode,
   trace,
 } from "@opentelemetry/api";
+import {
+  AggregationTemporality,
+  type DataPoint,
+  DataPointType,
+  type Histogram,
+  InMemoryMetricExporter,
+  MeterProvider,
+  PeriodicExportingMetricReader,
+} from "@opentelemetry/sdk-metrics";
 import {
   InMemorySpanExporter,
   SimpleSpanProcessor,
@@ -117,6 +127,59 @@ function createRecordingMeter() {
     }),
   };
   return { meter: meter as unknown as StandardMeter, observations };
+}
+
+const TEST_SERVICE_NAME = "otel-utils-fastify-test";
+
+const SEMCONV_BOUNDARIES = [
+  0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10,
+];
+
+/**
+ * Mirrors `StandardMeter` 1.9.1 name prefixing on top of a real SDK
+ * `MeterProvider`, so the exported histogram metadata and buckets can be
+ * asserted without a collector.
+ */
+function createSdkMeterHarness(serviceName = TEST_SERVICE_NAME) {
+  const exporter = new InMemoryMetricExporter(
+    AggregationTemporality.CUMULATIVE,
+  );
+  const reader = new PeriodicExportingMetricReader({
+    exporter,
+    exportIntervalMillis: 60_000,
+  });
+  const provider = new MeterProvider({ readers: [reader] });
+  const sdkMeter = provider.getMeter(`${serviceName}:test`);
+  const meter = {
+    createHistogram: (
+      name: string,
+      options?: MetricOptions & { unprefixed?: boolean },
+    ) => {
+      const { unprefixed, ...instrumentOptions } = options ?? {};
+      return sdkMeter.createHistogram(
+        unprefixed ? name : `${serviceName}.${name}`,
+        instrumentOptions,
+      );
+    },
+  } as unknown as StandardMeter;
+
+  const collect = async () => {
+    await provider.forceFlush();
+    const exported = exporter.getMetrics();
+    return exported[exported.length - 1].scopeMetrics.flatMap(
+      (scopeMetrics) => scopeMetrics.metrics,
+    );
+  };
+
+  return { meter, collect, shutdown: () => provider.shutdown() };
+}
+
+function nonzeroBucket(point: DataPoint<Histogram>): number {
+  return point.value.buckets.counts.findIndex((count) => count > 0);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function waitFor(assertion: () => void, timeoutMs = 3000) {
@@ -622,5 +685,135 @@ describe("cross-registration telemetry ownership", () => {
     expect(exporter.getFinishedSpans()).toHaveLength(1);
     expect(root.observations).toHaveLength(0);
     expect(warnings).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// http.server.request.duration semconv histogram (real SDK)
+// ---------------------------------------------------------------------------
+
+describe("http.server.request.duration semconv histogram", () => {
+  test("exports the semconv metadata and distinct sub-second buckets", async () => {
+    const harness = createSdkMeterHarness();
+    const app = Fastify();
+    registerHooks(app, { standardMeter: harness.meter });
+    app.get("/api/fast", async () => {
+      await delay(1);
+      return { ok: true };
+    });
+    app.get("/api/medium", async () => {
+      await delay(50);
+      return { ok: true };
+    });
+    app.get("/api/slow", async () => {
+      await delay(1100);
+      return { ok: true };
+    });
+
+    try {
+      expect(
+        (await app.inject({ method: "GET", url: "/api/fast" })).statusCode,
+      ).toBe(200);
+      expect(
+        (await app.inject({ method: "GET", url: "/api/medium" })).statusCode,
+      ).toBe(200);
+      expect(
+        (await app.inject({ method: "GET", url: "/api/slow" })).statusCode,
+      ).toBe(200);
+
+      const metrics = await harness.collect();
+      expect(metrics).toHaveLength(1);
+      const metric = metrics[0];
+      expect(metric.descriptor.name).toBe(
+        `${TEST_SERVICE_NAME}.http.server.request.duration`,
+      );
+      expect(metric.descriptor.unit).toBe("s");
+      expect(metric.descriptor.description).toBe(
+        "Duration of HTTP server requests.",
+      );
+
+      if (metric.dataPointType !== DataPointType.HISTOGRAM) {
+        throw new Error("expected a histogram metric");
+      }
+      const points = metric.dataPoints;
+      expect(points).toHaveLength(3);
+      for (const point of points) {
+        expect(point.value.buckets.boundaries).toEqual(SEMCONV_BOUNDARIES);
+        expect(point.value.count).toBe(1);
+      }
+
+      const byRoute = new Map(
+        points.map((point) => [String(point.attributes["http.route"]), point]),
+      );
+      const fastBucket = nonzeroBucket(byRoute.get("/api/fast")!);
+      const mediumBucket = nonzeroBucket(byRoute.get("/api/medium")!);
+      const slowBucket = nonzeroBucket(byRoute.get("/api/slow")!);
+      // Ranges absorb CI jitter; the point is that the observations no longer
+      // share a single coarse bucket.
+      expect([0, 1]).toContain(fastBucket);
+      expect([3, 4]).toContain(mediumBucket);
+      expect(slowBucket).toBe(10);
+      expect(new Set([fastBucket, mediumBucket, slowBucket]).size).toBe(3);
+    } finally {
+      await app.close();
+      await harness.shutdown();
+    }
+  });
+
+  test("unprefixedMetricName: true exports the exact semconv name", async () => {
+    const harness = createSdkMeterHarness();
+    const app = Fastify();
+    registerHooks(app, {
+      standardMeter: harness.meter,
+      unprefixedMetricName: true,
+    });
+    app.get("/api/test", async () => ({ ok: true }));
+
+    try {
+      await app.inject({ method: "GET", url: "/api/test" });
+
+      const metrics = await harness.collect();
+      expect(metrics).toHaveLength(1);
+      expect(metrics[0].descriptor.name).toBe("http.server.request.duration");
+    } finally {
+      await app.close();
+      await harness.shutdown();
+    }
+  });
+
+  test("honours custom boundaries without changing span behaviour", async () => {
+    const harness = createSdkMeterHarness();
+    const customBoundaries = [0.001, 0.01, 0.1, 1, 10];
+    const app = Fastify();
+    registerHooks(app, {
+      standardMeter: harness.meter,
+      histogramOptions: { explicitBucketBoundaries: customBoundaries },
+    });
+    app.get("/api/fast", async () => {
+      await delay(1);
+      return { ok: true };
+    });
+
+    try {
+      const res = await app.inject({ method: "GET", url: "/api/fast" });
+      expect(res.statusCode).toBe(200);
+
+      const metrics = await harness.collect();
+      expect(metrics).toHaveLength(1);
+      if (metrics[0].dataPointType !== DataPointType.HISTOGRAM) {
+        throw new Error("expected a histogram metric");
+      }
+      const [point] = metrics[0].dataPoints;
+      expect(point.value.buckets.boundaries).toEqual(customBoundaries);
+
+      const span = exporter
+        .getFinishedSpans()
+        .find((s) => s.name === "GET-/api/fast");
+      expect(span).toBeDefined();
+      expect(span!.attributes["http.response.status_code"]).toBe(200);
+    } finally {
+      await app.close();
+      await harness.shutdown();
+    }
   });
 });
