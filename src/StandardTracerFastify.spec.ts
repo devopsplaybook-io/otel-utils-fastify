@@ -165,6 +165,12 @@ function injectUnknownMethod(app: FastifyInstance, url: string) {
   });
 }
 
+/** Warning messages recorded by the mock registration logger. */
+function warningsOf(mockLogger: ReturnType<typeof createMockLogger>): string[] {
+  const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+  return moduleLogger.warn.mock.calls.map((call: unknown[]) => String(call[0]));
+}
+
 // ---------------------------------------------------------------------------
 // Request filtering
 // ---------------------------------------------------------------------------
@@ -657,6 +663,31 @@ describe("HTTP server span attributes", () => {
     expect(mockSpan.setAttribute).toHaveBeenCalledWith("server.port", 8443);
   });
 
+  test("strips IPv6 brackets from server.address", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({
+      method: "GET",
+      url: "/api/test",
+      headers: { host: "[::1]:8080" },
+    });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("server.address", "::1");
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("server.port", 8080);
+  });
+
+  test("strips IPv6 brackets from a full IPv6 address", async () => {
+    const { app, mockSpan } = buildApp();
+    await app.inject({
+      method: "GET",
+      url: "/api/test",
+      headers: { host: "[2001:db8::1]:9090" },
+    });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "server.address",
+      "2001:db8::1",
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith("server.port", 9090);
+  });
+
   test("omits server.address and server.port for an HTTP/1.0 request without Host", async () => {
     const { app, mockSpan } = buildApp();
     const port = await listen(app);
@@ -739,6 +770,224 @@ describe("HTTP method normalization", () => {
     expect(mockSpan.setAttribute).not.toHaveBeenCalledWith(
       "http.request.method_original",
       expect.anything(),
+    );
+  });
+
+  test("records QUERY as a known method", async () => {
+    const { app, mockTracer, mockSpan } = buildApp();
+    app.route({
+      method: "QUERY",
+      url: "/api/query/:id",
+      handler: async () => ({ ok: true }),
+    });
+    const res = await app.inject({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      method: "QUERY" as any,
+      url: "/api/query/7",
+      payload: "{}",
+      headers: { "content-type": "application/json" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "QUERY-/api/query/_id",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.request.method",
+      "QUERY",
+    );
+    expect(mockSpan.setAttribute).not.toHaveBeenCalledWith(
+      "http.request.method_original",
+      expect.anything(),
+    );
+  });
+
+  test("knownHttpMethods extends the known set (trimmed and uppercased)", async () => {
+    const { app, mockTracer, mockSpan } = buildApp({
+      knownHttpMethods: [" propfind ", "PROPFIND"],
+    });
+    await injectUnknownMethod(app, "/api/unknown");
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.request.method",
+      "PROPFIND",
+    );
+    expect(mockSpan.setAttribute).not.toHaveBeenCalledWith(
+      "http.request.method_original",
+      expect.anything(),
+    );
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "PROPFIND-/api/unknown",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+  });
+
+  test("ignores invalid knownHttpMethods entries with a warning", async () => {
+    const { app, mockSpan, mockLogger } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      knownHttpMethods: [42, "", "BAD METHOD", "PROPFIND"] as any,
+    });
+    await injectUnknownMethod(app, "/api/unknown");
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.request.method",
+      "PROPFIND",
+    );
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledTimes(3);
+    for (const call of moduleLogger.warn.mock.calls) {
+      expect(call[0]).toContain("knownHttpMethods");
+    }
+  });
+
+  test("warns and uses the built-in set for a non-array knownHttpMethods", async () => {
+    const { app, mockSpan, mockLogger } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      knownHttpMethods: "PROPFIND" as any,
+    });
+    await injectUnknownMethod(app, "/api/unknown");
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.request.method",
+      "_OTHER",
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.request.method_original",
+      "PROPFIND",
+    );
+    const moduleLogger = mockLogger.createModuleLogger.mock.results[0].value;
+    expect(moduleLogger.warn).toHaveBeenCalledTimes(1);
+    expect(moduleLogger.warn.mock.calls[0][0]).toContain("knownHttpMethods");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Semconv span naming
+// ---------------------------------------------------------------------------
+
+describe("semconv span naming", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test("keeps the route template verbatim for matched routes", async () => {
+    const { app, mockTracer, mockSpan } = buildApp({
+      spanNameFormat: "semconv",
+    });
+    await app.inject({ method: "GET", url: "/api/files/123" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "GET /api/files/:id",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.route",
+      "/api/files/:id",
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "url.path",
+      "/api/files/123",
+    );
+  });
+
+  test("uses HTTP as the span-name method for unknown methods on matched routes", async () => {
+    const mockSpan = createMockSpan();
+    const mockTracer = createMockTracer(mockSpan);
+    const mockLogger = createMockLogger();
+    const app = Fastify();
+    // Fastify cannot register unknown methods, so simulate a matched route for
+    // PROPFIND by shadowing routeOptions before the tracing hook runs.
+    app.addHook("onRequest", async (req) => {
+      if (req.method === "PROPFIND") {
+        Object.defineProperty(req, "routeOptions", {
+          value: { url: "/api/files/:id" },
+          configurable: true,
+        });
+      }
+    });
+    app.get("/api/files/:id", async () => ({ ok: true }));
+    StandardTracerFastifyRegisterHooks(
+      app,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mockTracer as any,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      mockLogger as any,
+      { spanNameFormat: "semconv" },
+    );
+
+    const res = await injectUnknownMethod(app, "/api/files/123");
+    expect(res.statusCode).toBe(404);
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "HTTP /api/files/:id",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.request.method",
+      "_OTHER",
+    );
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.request.method_original",
+      "PROPFIND",
+    );
+  });
+
+  test("never uses the URI path for unmatched routes", async () => {
+    const { app, mockTracer, mockSpan } = buildApp({
+      spanNameFormat: "semconv",
+    });
+    const res = await app.inject({ method: "GET", url: "/api/unknown/42" });
+    expect(res.statusCode).toBe(404);
+    expect(mockTracer.startSpan).toHaveBeenCalledWith("GET", undefined, {
+      kind: SpanKind.SERVER,
+    });
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "url.path",
+      "/api/unknown/42",
+    );
+    expect(mockSpan.setAttribute).not.toHaveBeenCalledWith(
+      "http.route",
+      expect.anything(),
+    );
+  });
+
+  test("ignores unmatchedRouteSpanName in semconv format", async () => {
+    const { app, mockTracer } = buildApp({
+      spanNameFormat: "semconv",
+      unmatchedRouteSpanName: "method",
+    });
+    await app.inject({ method: "GET", url: "/api/unknown/42" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith("GET", undefined, {
+      kind: SpanKind.SERVER,
+    });
+  });
+
+  test("uses HTTP for unmatched unknown methods", async () => {
+    const { app, mockTracer } = buildApp({ spanNameFormat: "semconv" });
+    await injectUnknownMethod(app, "/api/unknown");
+    expect(mockTracer.startSpan).toHaveBeenCalledWith("HTTP", undefined, {
+      kind: SpanKind.SERVER,
+    });
+  });
+
+  test("keeps legacy names when spanNameFormat is explicitly legacy", async () => {
+    const { app, mockTracer } = buildApp({ spanNameFormat: "legacy" });
+    await app.inject({ method: "GET", url: "/api/files/123" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "GET-/api/files/_id",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+  });
+
+  test("strips control characters from semconv span names", async () => {
+    const { app, mockTracer } = buildApp({ spanNameFormat: "semconv" });
+    app.get("/api/weird\nroute", async () => ({ ok: true }));
+    const res = await app.inject({ method: "GET", url: "/api/weird%0Aroute" });
+    expect(res.statusCode).toBe(200);
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "GET /api/weirdroute",
+      undefined,
+      { kind: SpanKind.SERVER },
     );
   });
 });
@@ -1203,6 +1452,199 @@ describe("unmatchedRouteSpanName option", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Option validation at registration
+// ---------------------------------------------------------------------------
+
+describe("option validation", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test("prepends a missing leading slash to rootApiPath and warns", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({ rootApiPath: "api" });
+    await app.inject({ method: "GET", url: "/api/test" });
+    expect(mockTracer.startSpan).toHaveBeenCalledTimes(1);
+    const warnings = warningsOf(mockLogger);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("rootApiPath");
+    expect(warnings[0]).toContain('normalized to "/api"');
+  });
+
+  test("treats rootApiPath: '' as / and traces every path", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({ rootApiPath: "" });
+    app.get("/outside", async () => ({ ok: true }));
+    await app.inject({ method: "GET", url: "/outside" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "GET-/outside",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+    const warnings = warningsOf(mockLogger);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('normalized to "/"');
+  });
+
+  test("trims whitespace and trailing slashes from rootApiPath and warns", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({ rootApiPath: " api/ " });
+    await app.inject({ method: "GET", url: "/api/test" });
+    expect(mockTracer.startSpan).toHaveBeenCalledTimes(1);
+    expect(warningsOf(mockLogger)).toHaveLength(1);
+    expect(warningsOf(mockLogger)[0]).toContain('normalized to "/api"');
+  });
+
+  test("does not warn for already normalized rootApiPath values", async () => {
+    for (const rootApiPath of ["/api", "/"]) {
+      const { app, mockLogger } = buildApp({ rootApiPath });
+      expect(warningsOf(mockLogger)).toEqual([]);
+      await app.close();
+    }
+  });
+
+  test("warns and falls back to /api for a non-string rootApiPath", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      rootApiPath: 42 as any,
+    });
+    await app.inject({ method: "GET", url: "/api/test" });
+    expect(mockTracer.startSpan).toHaveBeenCalledTimes(1);
+    const warnings = warningsOf(mockLogger);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("rootApiPath");
+    expect(warnings[0]).toContain("/api");
+  });
+
+  test("accepts the explicit unmatchedRouteSpanName values without warning", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({
+      unmatchedRouteSpanName: "method",
+    });
+    await app.inject({ method: "GET", url: "/api/unknown/42" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith("GET", undefined, {
+      kind: SpanKind.SERVER,
+    });
+    expect(warningsOf(mockLogger)).toEqual([]);
+  });
+
+  test("warns and falls back to path naming for an invalid unmatchedRouteSpanName", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      unmatchedRouteSpanName: "uri" as any,
+    });
+    await app.inject({ method: "GET", url: "/api/unknown/42" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "GET-/api/unknown/42",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+    const warnings = warningsOf(mockLogger);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("unmatchedRouteSpanName");
+  });
+
+  test("warns and falls back to legacy naming for an invalid spanNameFormat", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      spanNameFormat: "otel" as any,
+    });
+    await app.inject({ method: "GET", url: "/api/test" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "GET-/api/test",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+    const warnings = warningsOf(mockLogger);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("spanNameFormat");
+  });
+
+  test("warns and ignores a non-array ignoreList", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ignoreList: "GET-/api/test" as any,
+    });
+    await app.inject({ method: "GET", url: "/api/test" });
+    expect(mockTracer.startSpan).toHaveBeenCalledTimes(1);
+    const warnings = warningsOf(mockLogger);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("ignoreList");
+  });
+
+  test("warns and ignores invalid ignoreList entries", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ignoreList: ["GET-/api/test", 42, ""] as any,
+    });
+    await app.inject({ method: "GET", url: "/api/test" });
+    expect(mockTracer.startSpan).not.toHaveBeenCalled();
+    await app.inject({ method: "GET", url: "/api/status" });
+    expect(mockTracer.startSpan).toHaveBeenCalledTimes(1);
+    const warnings = warningsOf(mockLogger);
+    expect(warnings).toHaveLength(2);
+    expect(warnings.every((warning) => warning.includes("ignoreList"))).toBe(
+      true,
+    );
+  });
+
+  test("auto-sanitizes and trims legacy ignoreList entries", async () => {
+    const { app, mockTracer } = buildApp({
+      ignoreList: [" GET-/api/files/:id "],
+    });
+    await app.inject({ method: "GET", url: "/api/files/123" });
+    expect(mockTracer.startSpan).not.toHaveBeenCalled();
+  });
+
+  test("auto-sanitizes ignoreListPrefix entries", async () => {
+    const { app, mockTracer } = buildApp({
+      ignoreListPrefix: ["GET-/api/files/"],
+    });
+    await app.inject({ method: "GET", url: "/api/files/123" });
+    expect(mockTracer.startSpan).not.toHaveBeenCalled();
+  });
+
+  test("auto-sanitizes ignoreListSuffix entries", async () => {
+    const { app, mockTracer } = buildApp({
+      ignoreListSuffix: [" :id "],
+    });
+    await app.inject({ method: "GET", url: "/api/files/123" });
+    expect(mockTracer.startSpan).not.toHaveBeenCalled();
+  });
+
+  test("matches semconv ignoreList entries verbatim", async () => {
+    const { app, mockTracer } = buildApp({
+      spanNameFormat: "semconv",
+      ignoreList: ["GET /api/files/:id"],
+    });
+    await app.inject({ method: "GET", url: "/api/files/123" });
+    expect(mockTracer.startSpan).not.toHaveBeenCalled();
+  });
+
+  test("legacy ignore entries do not match semconv span names", async () => {
+    const { app, mockTracer } = buildApp({
+      spanNameFormat: "semconv",
+      ignoreList: ["GET-/api/files/_id"],
+    });
+    await app.inject({ method: "GET", url: "/api/files/123" });
+    expect(mockTracer.startSpan).toHaveBeenCalledWith(
+      "GET /api/files/:id",
+      undefined,
+      { kind: SpanKind.SERVER },
+    );
+  });
+
+  test("warns and ignores semconv ignoreList entries empty after normalization", async () => {
+    const { app, mockTracer, mockLogger } = buildApp({
+      spanNameFormat: "semconv",
+      ignoreList: ["\u0000"],
+    });
+    await app.inject({ method: "GET", url: "/api/test" });
+    expect(mockTracer.startSpan).toHaveBeenCalledTimes(1);
+    const warnings = warningsOf(mockLogger);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("ignoreList");
+    expect(warnings[0]).toContain("empty after normalization");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // standardMeter option (B2)
 // ---------------------------------------------------------------------------
 
@@ -1333,6 +1775,36 @@ describe("standardMeter option", () => {
       "network.protocol.version": "1.1",
       "http.response.status_code": 404,
     });
+  });
+
+  test("records QUERY and extended known methods in the histogram", async () => {
+    const meter = createMockMeter();
+    const { app } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      standardMeter: meter as any,
+      knownHttpMethods: ["PROPFIND"],
+    });
+    app.route({
+      method: "QUERY",
+      url: "/api/query",
+      handler: async () => ({ ok: true }),
+    });
+
+    await app.inject({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      method: "QUERY" as any,
+      url: "/api/query",
+      payload: "{}",
+      headers: { "content-type": "application/json" },
+    });
+    await injectUnknownMethod(app, "/api/unknown");
+
+    expect(meter.histogram.record).toHaveBeenCalledTimes(2);
+    const methods = meter.histogram.record.mock.calls.map(
+      (call: unknown[]) =>
+        (call[1] as Record<string, unknown>)["http.request.method"],
+    );
+    expect(methods).toEqual(["QUERY", "PROPFIND"]);
   });
 
   test("does not record for ignored requests", async () => {
