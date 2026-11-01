@@ -1444,3 +1444,55 @@ describe("OTelRequestContext and req.tracerSpanApi", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-request state cleanup
+// ---------------------------------------------------------------------------
+
+describe("per-request state cleanup", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  function captureAfterResponse(app: FastifyInstance) {
+    const captured: {
+      span?: unknown;
+      context?: unknown;
+      alias?: unknown;
+    } = {};
+    app.addHook("onResponse", async (req) => {
+      captured.span = OTelRequestSpan(req);
+      captured.context = OTelRequestContext(req);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      captured.alias = (req as any).tracerSpanApi;
+    });
+    return captured;
+  }
+
+  test("clears the span, context and deprecated alias after onResponse", async () => {
+    const { app, mockSpan } = buildApp();
+    const captured = captureAfterResponse(app);
+
+    const res = await app.inject({ method: "GET", url: "/api/test" });
+
+    expect(res.statusCode).toBe(200);
+    expect(mockSpan.end).toHaveBeenCalledTimes(1);
+    expect(captured.span).toBeUndefined();
+    expect(captured.context).toBeUndefined();
+    expect(captured.alias).toBeUndefined();
+  });
+
+  test("clears the state after onError and onResponse", async () => {
+    const { app, mockSpan } = buildApp();
+    const captured = captureAfterResponse(app);
+
+    const res = await app.inject({ method: "GET", url: "/api/error-test" });
+
+    expect(res.statusCode).toBe(500);
+    expect(mockSpan.end).toHaveBeenCalledTimes(1);
+    expect(mockSpan.recordException).toHaveBeenCalledTimes(1);
+    expect(captured.span).toBeUndefined();
+    expect(captured.context).toBeUndefined();
+    expect(captured.alias).toBeUndefined();
+  });
+});

@@ -21,6 +21,7 @@ import type {
 } from "@devopsplaybook.io/otel-utils";
 import {
   StandardTracerFastifyRegisterHooks,
+  StandardTracerFastifyRegisterHooksOptions,
   OTelRequestContext,
   OTelRequestSpan,
 } from "./StandardTracerFastify";
@@ -76,13 +77,31 @@ const testLogger = {
   }),
 };
 
-function registerHooks(app: FastifyInstance, meter?: StandardMeter): void {
+function registerHooks(
+  app: FastifyInstance,
+  options?: StandardTracerFastifyRegisterHooksOptions,
+  logger: StandardLogger = testLogger as unknown as StandardLogger,
+): void {
   StandardTracerFastifyRegisterHooks(
     app,
     testTracer as unknown as StandardTracer,
-    testLogger as unknown as StandardLogger,
-    meter ? { standardMeter: meter } : undefined,
+    logger,
+    options,
   );
+}
+
+function createRecordingLogger() {
+  const warnings: string[] = [];
+  const logger = {
+    createModuleLogger: () => ({
+      info: () => {},
+      warn: (message: string) => {
+        warnings.push(message);
+      },
+      error: () => {},
+    }),
+  };
+  return { logger: logger as unknown as StandardLogger, warnings };
 }
 
 function createRecordingMeter() {
@@ -259,7 +278,7 @@ describe("error handling", () => {
   test("records error.type on a returned 5xx response", async () => {
     const { meter, observations } = createRecordingMeter();
     const app = Fastify();
-    registerHooks(app, meter);
+    registerHooks(app, { standardMeter: meter });
     app.get("/api/server-error", async (_req, reply) =>
       reply.status(500).send({ error: "boom" }),
     );
@@ -282,7 +301,7 @@ describe("error handling", () => {
   test("keeps the specific error.type on a thrown 5xx response", async () => {
     const { meter, observations } = createRecordingMeter();
     const app = Fastify();
-    registerHooks(app, meter);
+    registerHooks(app, { standardMeter: meter });
     app.get("/api/boom", async () => {
       throw new Error("boom");
     });
@@ -380,8 +399,9 @@ describe("HTTP server span attributes", () => {
 
 describe("span ending on abort and timeout", () => {
   test("a client abort ends the HTTP span with ERROR", async () => {
+    const { meter, observations } = createRecordingMeter();
     const app = Fastify();
-    registerHooks(app);
+    registerHooks(app, { standardMeter: meter });
     app.get("/api/hang", async () => new Promise(() => {}));
     const port = await listen(app);
     try {
@@ -404,14 +424,17 @@ describe("span ending on abort and timeout", () => {
       expect(span.name).toBe("GET-/api/hang");
       expect(span.status.code).toBe(SpanStatusCode.ERROR);
       expect(span.attributes["error.type"]).toBe("client_abort");
+      expect(observations).toHaveLength(1);
+      expect(observations[0].attributes["error.type"]).toBe("client_abort");
     } finally {
       await app.close();
     }
   });
 
   test("a connection timeout ends the HTTP span with ERROR", async () => {
+    const { meter, observations } = createRecordingMeter();
     const app = Fastify({ connectionTimeout: 150 });
-    registerHooks(app);
+    registerHooks(app, { standardMeter: meter });
     app.get("/api/hang", async () => new Promise(() => {}));
     const port = await listen(app);
     try {
@@ -425,6 +448,8 @@ describe("span ending on abort and timeout", () => {
       expect(span.name).toBe("GET-/api/hang");
       expect(span.status.code).toBe(SpanStatusCode.ERROR);
       expect(span.attributes["error.type"]).toBe("timeout");
+      expect(observations).toHaveLength(1);
+      expect(observations[0].attributes["error.type"]).toBe("timeout");
       client.destroy();
     } finally {
       await app.close();
@@ -473,5 +498,129 @@ describe("encapsulated duplicate registration", () => {
     expect(spans).toHaveLength(1);
     expect(spans[0].name).toBe("GET-/api/child");
     expect(spans[0].attributes["http.response.status_code"]).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-registration telemetry ownership
+// ---------------------------------------------------------------------------
+
+describe("cross-registration telemetry ownership", () => {
+  interface CrossRegistrationSetup {
+    child?: StandardTracerFastifyRegisterHooksOptions;
+    root?: StandardTracerFastifyRegisterHooksOptions;
+  }
+
+  /**
+   * Registers the child hooks inside `app.register()` and the root hooks in
+   * `app.after()`, which makes the child hooks run first for requests routed
+   * through the child scope (child registered before its root).
+   */
+  function buildCrossRegisteredApp({ child, root }: CrossRegistrationSetup) {
+    const { logger, warnings } = createRecordingLogger();
+    const app = Fastify();
+    app.register(async (childInstance) => {
+      registerHooks(childInstance, child, logger);
+      childInstance.get("/api/child", async () => ({ ok: true }));
+    });
+    app.after(() => {
+      registerHooks(app, root, logger);
+    });
+    return { app, warnings };
+  }
+
+  test("meter only on the root: one observation recorded with the root meter", async () => {
+    const root = createRecordingMeter();
+    const { app, warnings } = buildCrossRegisteredApp({
+      root: { standardMeter: root.meter },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/child" });
+    expect(res.statusCode).toBe(200);
+
+    const spans = exporter.getFinishedSpans();
+    expect(spans).toHaveLength(1);
+    expect(spans[0].name).toBe("GET-/api/child");
+    expect(root.observations).toHaveLength(1);
+    expect(root.observations[0].attributes).toEqual({
+      "http.request.method": "GET",
+      "url.scheme": "http",
+      "network.protocol.version": "1.1",
+      "http.route": "/api/child",
+      "http.response.status_code": 200,
+    });
+    expect(warnings).toEqual([]);
+  });
+
+  test("meter only on the child and the child traces: one observation with the child meter", async () => {
+    const child = createRecordingMeter();
+    const { app, warnings } = buildCrossRegisteredApp({
+      child: { standardMeter: child.meter },
+    });
+
+    await app.inject({ method: "GET", url: "/api/child" });
+
+    expect(exporter.getFinishedSpans()).toHaveLength(1);
+    expect(child.observations).toHaveLength(1);
+    expect(warnings).toEqual([]);
+  });
+
+  test("meter only on the child and the child filters: no throw, no observation, one span", async () => {
+    const child = createRecordingMeter();
+    const { app, warnings } = buildCrossRegisteredApp({
+      // The child filters the request out; the root (default "/api") traces it.
+      child: { standardMeter: child.meter, rootApiPath: "/api/other" },
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/child" });
+    expect(res.statusCode).toBe(200);
+
+    expect(exporter.getFinishedSpans()).toHaveLength(1);
+    expect(child.observations).toHaveLength(0);
+    // Ends the span created by the root without touching a missing start time,
+    // so no hook failure is logged.
+    expect(warnings).toEqual([]);
+  });
+
+  test("meters on both: one observation, by the registration that created the span", async () => {
+    const child = createRecordingMeter();
+    const root = createRecordingMeter();
+    const { app, warnings } = buildCrossRegisteredApp({
+      child: { standardMeter: child.meter },
+      root: { standardMeter: root.meter },
+    });
+
+    await app.inject({ method: "GET", url: "/api/child" });
+
+    expect(exporter.getFinishedSpans()).toHaveLength(1);
+    expect(child.observations).toHaveLength(1);
+    expect(root.observations).toHaveLength(0);
+    expect(warnings).toEqual([]);
+  });
+
+  test("no meter anywhere: span behaviour unchanged", async () => {
+    const { app, warnings } = buildCrossRegisteredApp({});
+
+    await app.inject({ method: "GET", url: "/api/child" });
+
+    const spans = exporter.getFinishedSpans();
+    expect(spans).toHaveLength(1);
+    expect(spans[0].name).toBe("GET-/api/child");
+    expect(spans[0].attributes["http.response.status_code"]).toBe(200);
+    expect(spans[0].attributes["http.route"]).toBe("/api/child");
+    expect(warnings).toEqual([]);
+  });
+
+  test("meter only on the root and the root filters: the filtering registration does not record", async () => {
+    const root = createRecordingMeter();
+    const { app, warnings } = buildCrossRegisteredApp({
+      root: { standardMeter: root.meter, rootApiPath: "/api/other" },
+    });
+
+    await app.inject({ method: "GET", url: "/api/child" });
+
+    expect(exporter.getFinishedSpans()).toHaveLength(1);
+    expect(root.observations).toHaveLength(0);
+    expect(warnings).toEqual([]);
   });
 });
