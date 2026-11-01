@@ -7,6 +7,7 @@ import {
   Context,
   context,
   defaultTextMapGetter,
+  Histogram,
   ROOT_CONTEXT,
   SpanKind,
   SpanStatusCode,
@@ -52,10 +53,20 @@ const KNOWN_HTTP_METHODS = new Set([
   "TRACE",
 ]);
 
-const requestSpans = new WeakMap<FastifyRequest, Span>();
-const requestContexts = new WeakMap<FastifyRequest, Context>();
-const requestStartTimes = new WeakMap<FastifyRequest, bigint>();
-const requestErrorTypes = new WeakMap<FastifyRequest, string>();
+interface RequestState {
+  span: Span;
+  context: Context;
+  startTime: bigint;
+  errorType?: string;
+  histogram?: Histogram;
+}
+
+// One record per traced request. The span (and its context and start time) is
+// created by the first registration in hook execution order that traces the
+// request; the histogram is filled by the first such registration that has a
+// `standardMeter`, so an observation is never attributed to a registration
+// that does not trace the request.
+const requestStates = new WeakMap<FastifyRequest, RequestState>();
 const registeredFastifyInstances = new WeakSet<FastifyInstance>();
 // Decorators are inherited by encapsulated child instances, so the marker
 // detects a registration made on any ancestor of the current instance.
@@ -122,6 +133,13 @@ export interface StandardTracerFastifyRegisterHooksOptions {
    * {@link StandardMeter} prefixes the metric name with the service id, so it
    * is exported as `<SERVICE_ID>.http.server.request.duration`.
    * When omitted, no metrics are recorded.
+   *
+   * Ownership across registrations: a traced request produces at most one
+   * observation, recorded by the first registration in hook execution order
+   * that traces the request and provides a `standardMeter`. A registration
+   * that filters the request out never records for it, even when it has a
+   * meter. Hook ordering therefore never changes where an observation is
+   * attributed.
    */
   standardMeter?: StandardMeter;
 }
@@ -162,6 +180,13 @@ export interface StandardTracerFastifyRegisterHooksOptions {
  * neutralized per request, so a request is never instrumented twice. Hooks
  * registered inside an encapsulated plugin only see the requests routed
  * through that plugin scope.
+ *
+ * **Telemetry ownership:** the first registration in hook execution order that
+ * traces a request creates its span; the first tracing registration that has a
+ * `standardMeter` supplies the `http.server.request.duration` histogram for it.
+ * A request traced only by registrations without a meter records no metric.
+ * Hook ordering therefore never changes which span or observation a request
+ * gets, and there is at most one observation per traced request.
  *
  * Use {@link OTelRequestContext} (or {@link OTelRequestSpan} as an explicit
  * parent) inside route handlers to attach the work of the request to the
@@ -217,26 +242,65 @@ export function StandardTracerFastifyRegisterHooks(
   };
 
   const clearRequestState = (req: FastifyRequest): void => {
-    requestSpans.delete(req);
-    requestContexts.delete(req);
-    requestStartTimes.delete(req);
-    requestErrorTypes.delete(req);
+    requestStates.delete(req);
     // Deprecated alias: assigning undefined avoids a V8 hidden-class
     // transition per request; the tests assert `!== undefined`.
     (req as FastifyRequestWithSpanAlias).tracerSpanApi = undefined;
+  };
+
+  interface TracedRequest {
+    spanName: string;
+    path: string;
+    routeTemplate?: string;
+    method: string;
+  }
+
+  // Returns the span identity for a request this registration would trace, or
+  // `undefined` when the request is filtered out. Used both by span creation
+  // and by metric adoption so that a registration records only for requests it
+  // would itself trace.
+  const getTracedRequest = (req: FastifyRequest): TracedRequest | undefined => {
+    if (req.method === "OPTIONS") {
+      return undefined;
+    }
+    const path = getRequestPath(req.url);
+    if (
+      rootApiPath !== "/" &&
+      path !== rootApiPath &&
+      !path.startsWith(`${rootApiPath}/`)
+    ) {
+      return undefined;
+    }
+    const routeTemplate = req.routeOptions.url;
+    const method = normalizeHttpMethod(req.method);
+    let spanName: string;
+    if (routeTemplate) {
+      spanName = sanitizeSpanName(`${method}-${routeTemplate}`);
+    } else if (unmatchedRouteSpanName === "method") {
+      spanName = sanitizeSpanName(method);
+    } else {
+      spanName = sanitizeSpanName(`${method}-${path}`);
+    }
+    if (
+      options?.ignoreList?.includes(spanName) ||
+      options?.ignoreListPrefix?.some((p) => spanName.startsWith(p)) ||
+      options?.ignoreListSuffix?.some((s) => spanName.endsWith(s))
+    ) {
+      return undefined;
+    }
+    return { spanName, path, routeTemplate, method };
   };
 
   const endSpan = (
     req: FastifyRequest,
     end: { statusCode?: number; errorType?: string } = {},
   ): void => {
-    const span = requestSpans.get(req);
-    if (!span) {
+    const state = requestStates.get(req);
+    if (!state) {
       return;
     }
-    const recordedErrorType = requestErrorTypes.get(req);
+    const { span, startTime, histogram, errorType: recordedErrorType } = state;
     const errorRecorded = recordedErrorType !== undefined;
-    const startTime = requestStartTimes.get(req);
     clearRequestState(req);
     try {
       if (end.errorType) {
@@ -255,11 +319,11 @@ export function StandardTracerFastifyRegisterHooks(
         }
         span.setAttribute(ATTR_HTTP_RESPONSE_STATUS_CODE, end.statusCode);
       }
-      if (requestDurationHistogram) {
-        // The start time is always set in onRequest when the histogram is
-        // configured (same guard), so the lookup cannot miss here.
+      if (histogram) {
+        // The start time is captured with the span, so a histogram always has
+        // one; the observation belongs to the registration that supplied it.
         const durationSeconds =
-          Number(process.hrtime.bigint() - (startTime as bigint)) / 1e9;
+          Number(process.hrtime.bigint() - startTime) / 1e9;
         const attributes: Record<string, string | number> = {
           [ATTR_HTTP_REQUEST_METHOD]: normalizeHttpMethod(req.method),
           [ATTR_URL_SCHEME]: req.protocol,
@@ -279,7 +343,7 @@ export function StandardTracerFastifyRegisterHooks(
               recordedErrorType ?? String(end.statusCode);
           }
         }
-        requestDurationHistogram.record(durationSeconds, attributes);
+        histogram.record(durationSeconds, attributes);
       }
     } finally {
       span.end();
@@ -292,35 +356,21 @@ export function StandardTracerFastifyRegisterHooks(
       // Defense in depth for a child scope registered before its root: the
       // decorator cannot detect that ordering (decorators only flow
       // downwards), so the first hook to run owns the request's span.
-      if (requestSpans.has(req)) {
+      const existing = requestStates.get(req);
+      if (existing) {
+        // A later registration may supply the meter only when it would itself
+        // trace the request; a filtering registration never records for it.
+        if (
+          !existing.histogram &&
+          requestDurationHistogram &&
+          getTracedRequest(req)
+        ) {
+          existing.histogram = requestDurationHistogram;
+        }
         return;
       }
-      if (req.method === "OPTIONS") {
-        return;
-      }
-      const path = getRequestPath(req.url);
-      if (
-        rootApiPath !== "/" &&
-        path !== rootApiPath &&
-        !path.startsWith(`${rootApiPath}/`)
-      ) {
-        return;
-      }
-      const routeTemplate = req.routeOptions.url;
-      const method = normalizeHttpMethod(req.method);
-      let spanName: string;
-      if (routeTemplate) {
-        spanName = sanitizeSpanName(`${method}-${routeTemplate}`);
-      } else if (unmatchedRouteSpanName === "method") {
-        spanName = sanitizeSpanName(method);
-      } else {
-        spanName = sanitizeSpanName(`${method}-${path}`);
-      }
-      if (
-        options?.ignoreList?.includes(spanName) ||
-        options?.ignoreListPrefix?.some((p) => spanName.startsWith(p)) ||
-        options?.ignoreListSuffix?.some((s) => spanName.endsWith(s))
-      ) {
+      const traced = getTracedRequest(req);
+      if (!traced) {
         return;
       }
       const callerContext = propagator.extract(
@@ -331,15 +381,15 @@ export function StandardTracerFastifyRegisterHooks(
       // The span is created inside the extracted context so that it becomes a
       // child of the caller span when the request carries a `traceparent`.
       span = context.with(callerContext, () =>
-        standardTracer.startSpan(spanName, undefined, {
+        standardTracer.startSpan(traced.spanName, undefined, {
           kind: SpanKind.SERVER,
         }),
       );
-      span.setAttribute(ATTR_HTTP_REQUEST_METHOD, method);
-      if (method === HTTP_REQUEST_METHOD_VALUE_OTHER) {
+      span.setAttribute(ATTR_HTTP_REQUEST_METHOD, traced.method);
+      if (traced.method === HTTP_REQUEST_METHOD_VALUE_OTHER) {
         span.setAttribute(ATTR_HTTP_REQUEST_METHOD_ORIGINAL, req.method);
       }
-      span.setAttribute(ATTR_URL_PATH, path);
+      span.setAttribute(ATTR_URL_PATH, traced.path);
       span.setAttribute(ATTR_URL_SCHEME, req.protocol);
       if (req.hostname) {
         span.setAttribute(ATTR_SERVER_ADDRESS, req.hostname);
@@ -348,14 +398,15 @@ export function StandardTracerFastifyRegisterHooks(
         span.setAttribute(ATTR_SERVER_PORT, req.port);
       }
       span.setAttribute(ATTR_NETWORK_PROTOCOL_VERSION, req.raw.httpVersion);
-      if (routeTemplate) {
-        span.setAttribute(ATTR_HTTP_ROUTE, routeTemplate);
+      if (traced.routeTemplate) {
+        span.setAttribute(ATTR_HTTP_ROUTE, traced.routeTemplate);
       }
-      requestSpans.set(req, span);
-      requestContexts.set(req, trace.setSpan(callerContext, span));
-      if (requestDurationHistogram) {
-        requestStartTimes.set(req, process.hrtime.bigint());
-      }
+      requestStates.set(req, {
+        span,
+        context: trace.setSpan(callerContext, span),
+        startTime: process.hrtime.bigint(),
+        histogram: requestDurationHistogram,
+      });
       // Deprecated alias kept for consumers that reimplemented the accessor
       // (`req.tracerSpanApi` before 1.1.0); use OTelRequestSpan(req) instead.
       (req as FastifyRequestWithSpanAlias).tracerSpanApi = span;
@@ -367,7 +418,10 @@ export function StandardTracerFastifyRegisterHooks(
       } catch {
         // Instrumentation must never affect the request.
       }
-      clearRequestState(req);
+      // Only clear state this registration created, never another one's.
+      if (span) {
+        clearRequestState(req);
+      }
       logHookFailureOnce("onRequest", error);
     }
   });
@@ -385,14 +439,15 @@ export function StandardTracerFastifyRegisterHooks(
 
   fastify.addHook("onError", async (req: FastifyRequest, _reply, error) => {
     try {
-      const span = requestSpans.get(req);
-      if (!span) {
+      const state = requestStates.get(req);
+      if (!state) {
         return;
       }
+      const { span } = state;
       const normalizedError =
         error instanceof Error ? error : new Error(String(error));
       const errorType = getErrorType(normalizedError);
-      requestErrorTypes.set(req, errorType);
+      state.errorType = errorType;
       span.setStatus({ code: SpanStatusCode.ERROR });
       span.setAttribute(ATTR_ERROR_TYPE, errorType);
       span.recordException(normalizedError);
@@ -482,9 +537,10 @@ function getErrorType(error: Error): string {
 /**
  * Retrieves the OpenTelemetry span associated with a Fastify request.
  *
- * The span is created during the `onRequest` hook and stored in an internal
- * `WeakMap` keyed on the request object. Returns `undefined` when no span
- * exists (e.g., the request was skipped by filtering) or once the span ended.
+ * The span is created during the `onRequest` hook and stored, with the rest of
+ * the per-request state, in an internal `WeakMap` keyed on the request object.
+ * Returns `undefined` when no span exists (e.g., the request was skipped by
+ * filtering) or once the span ended.
  *
  * Use it to parent spans created in route handlers:
  * `standardTracer.startSpan("my-work", OTelRequestSpan(req))`.
@@ -493,7 +549,7 @@ function getErrorType(error: Error): string {
  * @returns The active span, or `undefined` if no span was created for this request.
  */
 export function OTelRequestSpan(req: FastifyRequest): Span | undefined {
-  return requestSpans.get(req);
+  return requestStates.get(req)?.span;
 }
 
 /**
@@ -509,5 +565,5 @@ export function OTelRequestSpan(req: FastifyRequest): Span | undefined {
  * @returns The request context, or `undefined` if no span was created for this request.
  */
 export function OTelRequestContext(req: FastifyRequest): Context | undefined {
-  return requestContexts.get(req);
+  return requestStates.get(req)?.context;
 }

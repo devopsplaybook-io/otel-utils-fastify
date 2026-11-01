@@ -88,15 +88,17 @@ fastify.get("/api/files", async (req, res) => {
 
 Registers five Fastify hooks:
 
-| Hook             | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `onRequest`      | Extracts W3C trace context from incoming headers. Creates a `SpanKind.SERVER` span named after the route (`METHOD-<route template>`; path or method fallback when no route matched, see `unmatchedRouteSpanName`; unknown methods use `_OTHER`) and stores it plus its context in internal `WeakMap`s. Skips OPTIONS requests, paths outside `rootApiPath`, and ignored span names.                                                                  |
-| `onResponse`     | Ends the span: records `http.response.status_code` and sets the span status per the current OTel HTTP semantic conventions for server spans — **unset for 1xx–4xx, ERROR for 5xx** — then ends the span and removes it from the `WeakMap`s. A span on which `onError` already recorded an error keeps its ERROR status. Returned 5xx responses without a recorded exception also get `error.type` set to the status code as a string (e.g. `"500"`). |
-| `onError`        | Sets span status to ERROR, records `error.type` and the exception, and logs the error via `ModuleLogger` with trace context: **`warn` (no stack) for client errors** (`statusCode < 500`, e.g. validation 400 or 403), `error` otherwise. Non-`Error` throws are normalized to an `Error` first.                                                                                                                                                     |
-| `onRequestAbort` | Ends the span with ERROR status and `error.type = "client_abort"` when the client aborts the request.                                                                                                                                                                                                                                                                                                                                                |
-| `onTimeout`      | Ends the span with ERROR status and `error.type = "timeout"` when the connection times out.                                                                                                                                                                                                                                                                                                                                                          |
+| Hook             | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `onRequest`      | Extracts W3C trace context from incoming headers. Creates a `SpanKind.SERVER` span named after the route (`METHOD-<route template>`; path or method fallback when no route matched, see `unmatchedRouteSpanName`; unknown methods use `_OTHER`) and stores it, its context, the start time and the owning histogram in one internal per-request state record (a `WeakMap` keyed on the request). Skips OPTIONS requests, paths outside `rootApiPath`, and ignored span names. |
+| `onResponse`     | Ends the span: records `http.response.status_code` and sets the span status per the current OTel HTTP semantic conventions for server spans — **unset for 1xx–4xx, ERROR for 5xx** — then ends the span and clears the per-request state. A span on which `onError` already recorded an error keeps its ERROR status. Returned 5xx responses without a recorded exception also get `error.type` set to the status code as a string (e.g. `"500"`).                            |
+| `onError`        | Sets span status to ERROR, records `error.type` and the exception, and logs the error via `ModuleLogger` with trace context: **`warn` (no stack) for client errors** (`statusCode < 500`, e.g. validation 400 or 403), `error` otherwise. Non-`Error` throws are normalized to an `Error` first.                                                                                                                                                                              |
+| `onRequestAbort` | Ends the span with ERROR status and `error.type = "client_abort"` when the client aborts the request.                                                                                                                                                                                                                                                                                                                                                                         |
+| `onTimeout`      | Ends the span with ERROR status and `error.type = "timeout"` when the connection times out.                                                                                                                                                                                                                                                                                                                                                                                   |
 
 Registration is idempotent across the instance tree: a second registration on the same instance **or on an encapsulated child of an already-registered instance** is ignored with a warning. The internal `otelUtilsFastifyHooksRegistered` decorator marks a registered instance and is inherited by encapsulated children; a child registered before its root cannot be detected at registration time and is additionally neutralized per request, so a request is never instrumented twice. Hooks are registered globally and cannot be removed — register them **once**, at the root of the Fastify instance.
+
+**Telemetry ownership across registrations:** a traced request produces one span and **at most one** `http.server.request.duration` observation, regardless of hook ordering. The span is created by the first registration in hook execution order that traces the request. The observation is recorded by the first registration in hook execution order that both **traces the request** and provides a `standardMeter`; a registration that filters the request out never records for it. Consequently, a request traced only by registrations without a `standardMeter` records no metric, while a metered root still records it when an unmetered child registers first.
 
 Tracing is **fail-open**: a fault in any hook (including a throwing tracer, span or logger) is caught, logged once at warn level through the `ModuleLogger`, and the request continues untraced — instrumentation never fails the request. If `onRequest` fails after the span was created, the span is ended (best effort) before the request continues untraced, so it is not leaked.
 
@@ -156,6 +158,8 @@ When a [`StandardMeter`](https://github.com/devopsplaybook-io/otel-utils) is pas
 - Returned 5xx responses also carry `error.type`: the status code as a string (e.g. `"500"`), or the specific value recorded by `onError` (`FST_ERR_VALIDATION`, the error name, ...) when an exception was thrown. A specific thrown-error value is never replaced by the status code.
 - Deliberately **not** recorded on the metric: `http.request.method_original` (bounded cardinality) and `server.address` / `server.port` (semconv opt-in), so the metric attributes stay low-cardinality.
 - The same `rootApiPath` / ignore-list filtering applies: only traced requests record, and the histogram counts are the traced request counts.
+
+**Ownership across registrations.** When several registrations see the same request (for example hooks registered on an encapsulated child and on its root), the request still produces exactly one observation. It is recorded with the histogram of the first registration in hook execution order that **traces the request and has a `standardMeter`**. A registration that filters the request out (`rootApiPath`, ignore lists, OPTIONS) never records for it, even when it has a meter. A registration without `standardMeter` produces no metric even when another registration has one; a request traced only by unmetered registrations records nothing. Hook ordering therefore never changes which span or observation a request gets.
 
 ```typescript
 const meter = new StandardMeter(config);
@@ -224,19 +228,25 @@ onRequest hook
   ├── propagator.extract(headers)  ← W3C trace context from caller
   ├── context.with(ctx, () => { ... })
   │     └── standardTracer.startSpan(spanName, undefined, { kind: SERVER })
-  │           └── WeakMap<req, span> + WeakMap<req, context>
+  │           └── WeakMap<req, { span, context, startTime, errorType?, histogram? }>
   └── Route handler
         └── OTelRequestSpan(req)
               or context.with(OTelRequestContext(req), () => ...)
 onResponse / onError / onRequestAbort / onTimeout
-  └── WeakMap.get(req) → span
+  └── WeakMap.get(req) → per-request state
         ├── span.setStatus({ code })
         ├── span.setAttribute(...)
+        ├── histogram.record(duration)  ← only when the owning state has one
         ├── span.end() / span.recordException(error)
         └── WeakMap.delete(req)
 ```
 
-The span and context are stored in `WeakMap`s rather than as properties on the request object, avoiding type pollution and allowing natural garbage collection. The `tracerSpanApi` alias is set to `undefined` when the span ends (it is a plain property, so it must be cleaned up explicitly).
+The span, context, start time and owning histogram are stored in one per-request state record in a `WeakMap` rather than as properties on the request object, avoiding type pollution and allowing natural garbage collection. The `tracerSpanApi` alias is set to `undefined` when the span ends (it is a plain property, so it must be cleaned up explicitly).
+
+## Bug fixes in 1.8.0
+
+- **Cross-registration telemetry ownership fixed**: the per-request span, context, start time and metric histogram are now stored in a single per-request state record owned by the registration that created the span. Previously they lived in four module-level `WeakMap`s shared by every registration while each registration recorded with its own histogram, so a request handled by a child scope registered before its root could silently record no observation, or the `onResponse` hook could throw `Cannot mix BigInt and other types, use explicit conversions` when the span creator had no meter and the ending registration did. A traced request now produces one span and at most one observation, recorded with the meter of the first registration in hook execution order that traces the request and has a `standardMeter`.
+- No new option, no new metric, and no change to metric names, units or bucket boundaries. Single-registration behaviour is unchanged.
 
 ## Documentation changes in 1.7.0
 
