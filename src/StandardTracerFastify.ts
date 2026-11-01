@@ -33,8 +33,15 @@ import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 const propagator = new W3CTraceContextPropagator();
 // Same sanitization as @devopsplaybook.io/otel-utils, applied here so that
-// `ignoreList` entries are matched against the exported span name.
+// `ignoreList` entries are matched against the exported legacy span name.
 const SPAN_NAME_SANITIZE_RE = /[^a-zA-Z0-9-_/]/g;
+// Semconv span names keep the server-provided route template verbatim; only
+// ASCII control characters are stripped because they can break trace backends.
+// oxlint-disable-next-line no-control-regex -- Control characters break backends and must be stripped.
+const SPAN_NAME_CONTROL_CHARS_RE = /[\u0000-\u001F\u007F]/g;
+const HTTP_METHOD_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const IPV6_BRACKET_RE = /^\[(.+)\]$/;
+const SEMCONV_UNKNOWN_METHOD_SPAN_NAME = "HTTP";
 const DEFAULT_ROOT_API_PATH = "/api";
 const INTERNAL_URL_BASE = "http://internal";
 
@@ -46,8 +53,9 @@ const HTTP_SERVER_REQUEST_DURATION_DESCRIPTION =
 const DEFAULT_HTTP_SERVER_REQUEST_DURATION_BUCKET_BOUNDARIES: readonly number[] =
   [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10];
 
-// Known methods of the semconv `http.request.method` enum. Everything else is
-// recorded as `_OTHER` (with the verbatim method in
+// Known methods of the semconv `http.request.method` enum: the RFC 9110
+// methods plus `PATCH` and `QUERY`. `knownHttpMethods` can extend this set.
+// Everything else is recorded as `_OTHER` (with the verbatim method in
 // `http.request.method_original`) to keep the attribute cardinality bounded.
 const KNOWN_HTTP_METHODS = new Set([
   "CONNECT",
@@ -58,8 +66,12 @@ const KNOWN_HTTP_METHODS = new Set([
   "PATCH",
   "POST",
   "PUT",
+  "QUERY",
   "TRACE",
 ]);
+
+type SpanNameFormat = "legacy" | "semconv";
+type UnmatchedRouteSpanName = "path" | "method";
 
 interface RequestState {
   span: Span;
@@ -109,31 +121,44 @@ export interface StandardTracerFastifyRegisterHooksOptions {
    * Root path prefix for API routes.
    * Only requests under this path (the path itself or paths starting with
    * `"<rootApiPath>/"`) will be traced. Default `"/api"`.
+   *
+   * Normalized at registration: surrounding whitespace is trimmed, a missing
+   * leading `"/"` is prepended and trailing slashes are removed, with a
+   * warning. `""` (or a whitespace-only value) means `"/"`, which traces every
+   * path.
    */
   rootApiPath?: string;
   /**
-   * Span names to skip by exact match (e.g. `"GET-/api/health"`).
-   * Checked first, with a linear scan over the array entries.
-   * Format: `"METHOD-/route"` — the same sanitized format used for span names,
-   * with the route template for parameterized routes (e.g.
-   * `"GET-/api/files/_id"` for `/api/files/:id`). Unknown methods are named
-   * `_OTHER` (e.g. `"_OTHER-/api/files/_id"`).
+   * Span names to skip by exact match (e.g. `"GET-/api/health"` in the
+   * default `"legacy"` format, `"GET /api/health"` with
+   * `spanNameFormat: "semconv"`).
+   * Entries are trimmed and normalized like the span name of the selected
+   * format at registration, so `"GET-/api/files/:id"` matches
+   * `/api/files/:id` without manual sanitization; invalid entries are ignored
+   * with a warning. Checked first, with a linear scan over the array entries.
    */
   ignoreList?: string[];
   /**
    * Span names to skip when the span name **starts with** one of these strings.
    * Checked after exact match. Uses native `String.prototype.startsWith`.
+   * Entries are trimmed and normalized like the span name of the selected
+   * format at registration; invalid entries are ignored with a warning.
    * Example: `["GET-/api/public/"]` ignores all GET requests under that prefix.
    */
   ignoreListPrefix?: string[];
   /**
    * Span names to skip when the span name **ends with** one of these strings.
    * Checked last. Uses native `String.prototype.endsWith`.
+   * Entries are trimmed and normalized like the span name of the selected
+   * format at registration; invalid entries are ignored with a warning.
    * Example: `["/health", "/metrics"]` ignores all methods targeting those paths.
    */
   ignoreListSuffix?: string[];
   /**
-   * Span-name policy for requests that did not match a route (e.g. 404s).
+   * Span-name policy for requests that did not match a route (e.g. 404s) in
+   * the default `"legacy"` span-name format. Ignored with
+   * `spanNameFormat: "semconv"`, where unmatched requests are always named
+   * after the method only. Invalid values warn and fall back to `"path"`.
    *
    * - `"path"` (default): span name falls back to the sanitized request path.
    *   Unbounded span-name cardinality from scanner/probe traffic and attack
@@ -148,6 +173,33 @@ export interface StandardTracerFastifyRegisterHooksOptions {
    * Matched routes are unaffected.
    */
   unmatchedRouteSpanName?: "path" | "method";
+  /**
+   * Format of the HTTP span names. Default `"legacy"`.
+   *
+   * - `"legacy"`: `METHOD-<route>` (`GET-/api/files/_id` for
+   *   `/api/files/:id`), with the sanitized request path or the method as
+   *   fallback for unmatched routes (see `unmatchedRouteSpanName`).
+   * - `"semconv"`: `{method} {route}` with the route template kept verbatim
+   *   (`GET /api/files/:id`; `:id` and spaces are preserved, only ASCII
+   *   control characters are stripped). Unknown methods use `HTTP` as
+   *   `{method}` (the attribute stays `_OTHER` with
+   *   `http.request.method_original`). Unmatched requests are named after the
+   *   method only (`GET`, or `HTTP` for unknown methods) and never after the
+   *   URI path.
+   *
+   * Ignore lists match the exported span name, so their content differs
+   * between formats (`GET-/api/files/_id` versus `GET /api/files/:id`); they
+   * are normalized automatically for the selected format.
+   */
+  spanNameFormat?: "legacy" | "semconv";
+  /**
+   * Additional HTTP methods to consider known, on top of the built-in set
+   * (the RFC 9110 methods plus `PATCH` and `QUERY`). Entries are trimmed and
+   * uppercased; invalid entries are ignored with a warning. The built-in set
+   * can only be extended, never replaced, so a standard method can never
+   * become `_OTHER`.
+   */
+  knownHttpMethods?: string[];
   /**
    * Optional {@link StandardMeter} used to record the
    * `http.server.request.duration` histogram (in seconds) for traced requests.
@@ -195,13 +247,18 @@ export interface StandardTracerFastifyRegisterHooksOptions {
  * OpenTelemetry spans for each matching API request.
  *
  * - Extracts incoming W3C trace context from request headers for distributed tracing.
- * - Creates a `SpanKind.SERVER` span named `METHOD-<route>` (route template for
- *   matched routes, e.g. `GET-/api/files/_id` for `/api/files/:id`; path or
- *   method fallback when no route matched, see `unmatchedRouteSpanName`), with
- *   `http.request.method`, `http.request.method_original` (unknown methods
- *   only), `url.path`, `url.scheme`, `server.address`, `server.port`,
- *   `network.protocol.version` and `http.route` (route template) attributes.
- *   Unknown HTTP methods are normalized to `_OTHER` in the span name and
+ * - Creates a `SpanKind.SERVER` span named after the request:
+ *   - default `"legacy"` format: `METHOD-<route>` (route template for matched
+ *     routes, e.g. `GET-/api/files/_id` for `/api/files/:id`; sanitized path
+ *     or method fallback when no route matched, see
+ *     `unmatchedRouteSpanName`);
+ *   - `spanNameFormat: "semconv"`: `{method} {route}` with the verbatim route
+ *     template (`GET /api/files/:id`), `HTTP` as the method for unknown
+ *     methods, and the method only for unmatched routes (never the URI path).
+ *   The span carries `http.request.method`, `http.request.method_original`
+ *   (unknown methods only), `url.path`, `url.scheme`, `server.address`,
+ *   `server.port`, `network.protocol.version` and `http.route` (route
+ *   template) attributes. Unknown HTTP methods are normalized to `_OTHER` in
  *   `http.request.method`.
  * - Sets the span status according to the current HTTP semantic conventions for
  *   server spans: unset for 1xx-4xx responses, ERROR for 5xx responses and
@@ -267,8 +324,37 @@ export function StandardTracerFastifyRegisterHooks(
   fastify.decorate(REGISTERED_DECORATOR_NAME, true);
   registeredFastifyInstances.add(fastify);
 
-  const rootApiPath = normalizeRootApiPath(options?.rootApiPath);
-  const unmatchedRouteSpanName = options?.unmatchedRouteSpanName ?? "path";
+  // Validation runs once, after the duplicate-registration guard. Invalid
+  // options never throw: they warn and fall back to safe defaults.
+  const warn = (message: string): void => logger.warn(message);
+  const spanNameFormat = resolveSpanNameFormat(options?.spanNameFormat, warn);
+  const knownHttpMethods = resolveKnownHttpMethods(
+    options?.knownHttpMethods,
+    warn,
+  );
+  const rootApiPath = normalizeRootApiPath(options?.rootApiPath, warn);
+  const unmatchedRouteSpanName = resolveUnmatchedRouteSpanName(
+    options?.unmatchedRouteSpanName,
+    warn,
+  );
+  const ignoreList = normalizeIgnoreList(
+    options?.ignoreList,
+    "ignoreList",
+    spanNameFormat,
+    warn,
+  );
+  const ignoreListPrefix = normalizeIgnoreList(
+    options?.ignoreListPrefix,
+    "ignoreListPrefix",
+    spanNameFormat,
+    warn,
+  );
+  const ignoreListSuffix = normalizeIgnoreList(
+    options?.ignoreListSuffix,
+    "ignoreListSuffix",
+    spanNameFormat,
+    warn,
+  );
   const {
     histogramOptions,
     standardMeter,
@@ -340,19 +426,18 @@ export function StandardTracerFastifyRegisterHooks(
       return undefined;
     }
     const routeTemplate = req.routeOptions.url;
-    const method = normalizeHttpMethod(req.method);
-    let spanName: string;
-    if (routeTemplate) {
-      spanName = sanitizeSpanName(`${method}-${routeTemplate}`);
-    } else if (unmatchedRouteSpanName === "method") {
-      spanName = sanitizeSpanName(method);
-    } else {
-      spanName = sanitizeSpanName(`${method}-${path}`);
-    }
+    const method = normalizeHttpMethod(req.method, knownHttpMethods);
+    const spanName = buildSpanName(
+      spanNameFormat,
+      method,
+      routeTemplate,
+      path,
+      unmatchedRouteSpanName,
+    );
     if (
-      options?.ignoreList?.includes(spanName) ||
-      options?.ignoreListPrefix?.some((p) => spanName.startsWith(p)) ||
-      options?.ignoreListSuffix?.some((s) => spanName.endsWith(s))
+      ignoreList.includes(spanName) ||
+      ignoreListPrefix.some((p) => spanName.startsWith(p)) ||
+      ignoreListSuffix.some((s) => spanName.endsWith(s))
     ) {
       return undefined;
     }
@@ -393,7 +478,10 @@ export function StandardTracerFastifyRegisterHooks(
         const durationSeconds =
           Number(process.hrtime.bigint() - startTime) / 1e9;
         const attributes: Record<string, string | number> = {
-          [ATTR_HTTP_REQUEST_METHOD]: normalizeHttpMethod(req.method),
+          [ATTR_HTTP_REQUEST_METHOD]: normalizeHttpMethod(
+            req.method,
+            knownHttpMethods,
+          ),
           [ATTR_URL_SCHEME]: req.protocol,
           [ATTR_NETWORK_PROTOCOL_VERSION]: req.raw.httpVersion,
         };
@@ -460,7 +548,10 @@ export function StandardTracerFastifyRegisterHooks(
       span.setAttribute(ATTR_URL_PATH, traced.path);
       span.setAttribute(ATTR_URL_SCHEME, req.protocol);
       if (req.hostname) {
-        span.setAttribute(ATTR_SERVER_ADDRESS, req.hostname);
+        span.setAttribute(
+          ATTR_SERVER_ADDRESS,
+          normalizeServerAddress(req.hostname),
+        );
       }
       if (req.port !== null) {
         span.setAttribute(ATTR_SERVER_PORT, req.port);
@@ -546,24 +637,188 @@ export function StandardTracerFastifyRegisterHooks(
   });
 }
 
-function normalizeRootApiPath(rootApiPath?: string): string {
-  const normalized = (rootApiPath || DEFAULT_ROOT_API_PATH).replace(/\/+$/, "");
-  return normalized === "" ? "/" : normalized;
+function resolveSpanNameFormat(
+  value: unknown,
+  warn: (message: string) => void,
+): SpanNameFormat {
+  if (value === undefined) {
+    return "legacy";
+  }
+  if (value === "legacy" || value === "semconv") {
+    return value;
+  }
+  warn(
+    `Invalid spanNameFormat "${String(value)}": expected "legacy" or "semconv"; falling back to "legacy".`,
+  );
+  return "legacy";
+}
+
+function resolveKnownHttpMethods(
+  value: unknown,
+  warn: (message: string) => void,
+): ReadonlySet<string> {
+  const methods = new Set(KNOWN_HTTP_METHODS);
+  if (value === undefined) {
+    return methods;
+  }
+  if (!Array.isArray(value)) {
+    warn(
+      `Invalid knownHttpMethods "${String(value)}": expected an array of strings; using the built-in methods only.`,
+    );
+    return methods;
+  }
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      warn(
+        `Invalid knownHttpMethods entry "${String(entry)}": expected a string; ignoring it.`,
+      );
+      continue;
+    }
+    const method = entry.trim().toUpperCase();
+    if (!HTTP_METHOD_TOKEN_RE.test(method)) {
+      warn(
+        `Invalid knownHttpMethods entry "${entry}": not a valid HTTP method token; ignoring it.`,
+      );
+      continue;
+    }
+    methods.add(method);
+  }
+  return methods;
+}
+
+function normalizeRootApiPath(
+  value: unknown,
+  warn: (message: string) => void,
+): string {
+  if (value === undefined) {
+    return DEFAULT_ROOT_API_PATH;
+  }
+  if (typeof value !== "string") {
+    warn(
+      `Invalid rootApiPath "${String(value)}": expected a string; falling back to "${DEFAULT_ROOT_API_PATH}".`,
+    );
+    return DEFAULT_ROOT_API_PATH;
+  }
+  const trimmed = value.trim();
+  const withLeadingSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  const normalized = withLeadingSlash.replace(/\/+$/, "");
+  const result = normalized === "" ? "/" : normalized;
+  if (result !== value) {
+    warn(
+      `rootApiPath "${value}" was normalized to "${result}"; set the option to the normalized value to silence this warning.`,
+    );
+  }
+  return result;
+}
+
+function resolveUnmatchedRouteSpanName(
+  value: unknown,
+  warn: (message: string) => void,
+): UnmatchedRouteSpanName {
+  if (value === undefined) {
+    return "path";
+  }
+  if (value === "path" || value === "method") {
+    return value;
+  }
+  warn(
+    `Invalid unmatchedRouteSpanName "${String(value)}": expected "path" or "method"; falling back to "path".`,
+  );
+  return "path";
+}
+
+function normalizeIgnoreList(
+  value: unknown,
+  optionName: string,
+  format: SpanNameFormat,
+  warn: (message: string) => void,
+): string[] {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    warn(
+      `Invalid ${optionName} "${String(value)}": expected an array of strings; ignoring the option.`,
+    );
+    return [];
+  }
+  const normalized: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      warn(
+        `Invalid ${optionName} entry "${String(entry)}": expected a string; ignoring it.`,
+      );
+      continue;
+    }
+    const trimmed = entry.trim();
+    if (trimmed === "") {
+      warn(
+        `Invalid ${optionName} entry "${entry}": empty after trimming; ignoring it.`,
+      );
+      continue;
+    }
+    const spanName =
+      format === "semconv"
+        ? sanitizeSemconvSpanName(trimmed)
+        : sanitizeSpanName(trimmed);
+    if (spanName === "") {
+      warn(
+        `Invalid ${optionName} entry "${entry}": empty after normalization; ignoring it.`,
+      );
+      continue;
+    }
+    normalized.push(spanName);
+  }
+  return normalized;
+}
+
+function buildSpanName(
+  format: SpanNameFormat,
+  method: string,
+  routeTemplate: string | undefined,
+  path: string,
+  unmatchedRouteSpanName: UnmatchedRouteSpanName,
+): string {
+  if (format === "semconv") {
+    const spanMethod =
+      method === HTTP_REQUEST_METHOD_VALUE_OTHER
+        ? SEMCONV_UNKNOWN_METHOD_SPAN_NAME
+        : method;
+    return sanitizeSemconvSpanName(
+      routeTemplate ? `${spanMethod} ${routeTemplate}` : spanMethod,
+    );
+  }
+  if (routeTemplate) {
+    return sanitizeSpanName(`${method}-${routeTemplate}`);
+  }
+  return unmatchedRouteSpanName === "method"
+    ? sanitizeSpanName(method)
+    : sanitizeSpanName(`${method}-${path}`);
 }
 
 function sanitizeSpanName(name: string): string {
   return name.replace(SPAN_NAME_SANITIZE_RE, "_");
 }
 
+function sanitizeSemconvSpanName(name: string): string {
+  return name.replace(SPAN_NAME_CONTROL_CHARS_RE, "");
+}
+
+function normalizeServerAddress(hostname: string): string {
+  return hostname.replace(IPV6_BRACKET_RE, "$1");
+}
+
 /**
  * Maps the request method to its `http.request.method` semconv value: known
- * IANA methods are recorded as-is, anything else as `_OTHER` to keep the
- * attribute (and span-name) cardinality bounded.
+ * methods (built-in RFC 9110 methods plus `PATCH`/`QUERY`, extended by
+ * `knownHttpMethods`) are recorded as-is, anything else as `_OTHER` to keep
+ * the attribute (and span-name) cardinality bounded.
  */
-function normalizeHttpMethod(method: string): string {
-  return KNOWN_HTTP_METHODS.has(method)
-    ? method
-    : HTTP_REQUEST_METHOD_VALUE_OTHER;
+function normalizeHttpMethod(
+  method: string,
+  knownMethods: ReadonlySet<string>,
+): string {
+  return knownMethods.has(method) ? method : HTTP_REQUEST_METHOD_VALUE_OTHER;
 }
 
 /**

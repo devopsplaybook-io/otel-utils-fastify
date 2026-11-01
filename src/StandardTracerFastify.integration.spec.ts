@@ -454,6 +454,69 @@ describe("HTTP server span attributes", () => {
       exporter.getFinishedSpans().some((s) => s.name.includes("PROPFIND")),
     ).toBe(false);
   });
+
+  test("uses verbatim semconv span names for matched routes", async () => {
+    const app = Fastify();
+    registerHooks(app, { spanNameFormat: "semconv" });
+    app.get("/api/files/:id", async () => ({ ok: true }));
+
+    const res = await app.inject({ method: "GET", url: "/api/files/123" });
+    expect(res.statusCode).toBe(200);
+
+    const span = exporter
+      .getFinishedSpans()
+      .find((s) => s.name === "GET /api/files/:id");
+    expect(span).toBeDefined();
+    expect(span!.attributes["http.route"]).toBe("/api/files/:id");
+    expect(span!.attributes["url.path"]).toBe("/api/files/123");
+    expect(span!.attributes["http.request.method"]).toBe("GET");
+  });
+
+  test("strips IPv6 brackets from server.address", async () => {
+    const app = Fastify();
+    registerHooks(app);
+    app.get("/api/test", async () => ({ ok: true }));
+
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/test",
+      headers: { host: "[::1]:8080" },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const span = exporter
+      .getFinishedSpans()
+      .find((s) => s.name === "GET-/api/test");
+    expect(span).toBeDefined();
+    expect(span!.attributes["server.address"]).toBe("::1");
+    expect(span!.attributes["server.port"]).toBe(8080);
+  });
+
+  test("records QUERY as a known method", async () => {
+    const app = Fastify();
+    registerHooks(app);
+    app.route({
+      method: "QUERY",
+      url: "/api/query/:id",
+      handler: async () => ({ ok: true }),
+    });
+
+    const res = await app.inject({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      method: "QUERY" as any,
+      url: "/api/query/7",
+      payload: "{}",
+      headers: { "content-type": "application/json" },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const span = exporter
+      .getFinishedSpans()
+      .find((s) => s.name === "QUERY-/api/query/_id");
+    expect(span).toBeDefined();
+    expect(span!.attributes["http.request.method"]).toBe("QUERY");
+    expect(span!.attributes["http.request.method_original"]).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
