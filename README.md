@@ -12,7 +12,7 @@ Peer dependencies that must be installed and configured in the consuming project
 
 | Peer dependency                 | Version  |
 | ------------------------------- | -------- |
-| `@devopsplaybook.io/otel-utils` | `^1.3.0` |
+| `@devopsplaybook.io/otel-utils` | `^1.9.1` |
 | `fastify`                       | `^5.0.0` |
 
 Requires Node.js >= 22.
@@ -163,7 +163,7 @@ Attributes set on each HTTP span:
 
 The query string is not recorded (`url.query` is not set).
 
-`server.address` and `server.port` are derived from the client-controlled `Host` header — or from `X-Forwarded-Host` when Fastify `trustProxy` is enabled and the connecting peer is trusted — so they are only as trustworthy as the deployment's proxy configuration. `server.address` is the IP literal or hostname with a single pair of surrounding IPv6 brackets stripped (`[::1]` → `::1`), as the semantic conventions require. Arbitrary `Host` values also become attribute values: if inbound host names are not constrained by a proxy or load balancer, that introduces cardinality. 1.5.0 has no configured server-address override.
+`server.address` and `server.port` are derived from the client-controlled `Host` header — or from `X-Forwarded-Host` when Fastify `trustProxy` is enabled and the connecting peer is trusted — so they are only as trustworthy as the deployment's proxy configuration. `server.address` is the IP literal or hostname with a single pair of surrounding IPv6 brackets stripped (`[::1]` → `::1`), as the semantic conventions require. Arbitrary `Host` values also become attribute values: if inbound host names are not constrained by a proxy or load balancer, that introduces cardinality. There is no configured server-address override; the values always come from the request and the Fastify proxy configuration.
 
 ### Span status: returned vs thrown 4xx
 
@@ -277,6 +277,14 @@ onResponse / onError / onRequestAbort / onTimeout
 
 The span, context, start time and owning histogram are stored in one per-request state record in a `WeakMap` rather than as properties on the request object, avoiding type pollution and allowing natural garbage collection. The `tracerSpanApi` alias is set to `undefined` when the span ends (it is a plain property, so it must be cleaned up explicitly).
 
+## Documentation and dependency changes in 1.11.0
+
+- Aligned the peer-dependency table with `package.json`: `@devopsplaybook.io/otel-utils` is `^1.9.1` (it was still documented as `^1.3.0`).
+- Corrected the dependency table: the `Span` type comes from the declared `@opentelemetry/sdk-trace` dependency; `@opentelemetry/sdk-trace-base` is only transitive.
+- Removed version-anchored wording from the server-address, 1.3.0 peer and 1.7.0 metric notes, so they describe the current code and the deviations that remain: the `<SERVICE_ID>.` metric prefix (opt out with `unprefixedMetricName`), the legacy default span-name format (`spanNameFormat: "semconv"` opt-in) and the `"path"` fallback for unmatched routes (`unmatchedRouteSpanName: "method"` recommended).
+- Lockfile-only dependency refresh (no declared range changed): `fast-uri` 4.2.1 → 4.2.3 and its nested 3.1.8 copies → 3.1.9, `babel-plugin-istanbul` 8.0.0 → 8.0.2. `npm audit --omit=dev` reports 0 vulnerabilities; the remaining advisories are confined to the Jest 30 development chain, which has no non-breaking fix.
+- No runtime behaviour change.
+
 ## Behavior changes in 1.10.0
 
 - **`QUERY` is a known HTTP method**: requests using `QUERY` are recorded as `http.request.method=QUERY` (and `QUERY`-prefixed legacy span names) instead of `_OTHER`. This is an intentional correction to the current HTTP semantic conventions; no other method changes.
@@ -304,7 +312,7 @@ Consumers opt in to `spanNameFormat: "semconv"` and update ignore lists to the e
 
 - Refreshed the `req.tracerSpanApi` deprecation note: both known consumers migrated on 2026-10-02, no maintained consumer remains, concrete 2.0.0 removal criterion.
 - Fixed the `StandardMeter` link (wrong GitHub organization).
-- Documented the intentional span-status asymmetry for thrown 4xx responses and the metric deviations (`<SERVICE_ID>.` prefix, no unit `s`).
+- Documented the intentional span-status asymmetry for thrown 4xx responses and the metric deviations as they stood then (`<SERVICE_ID>.` prefix and the SDK default unit/boundaries; the unit, description and buckets have been semconv-aligned since 1.9.0).
 - Recommended `unmatchedRouteSpanName: "method"` in the quick start; `"path"` remains the default.
 - Added `repository`, `homepage`, `bugs` and `author` metadata to `package.json`.
 - No runtime behaviour change.
@@ -340,18 +348,18 @@ Consumers opt in to `spanNameFormat: "semconv"` and update ignore lists to the e
 - Spans are `SpanKind.SERVER`; synthetic `BACKEND` attributes from `StandardTracer` are no longer added.
 - Client aborts and connection timeouts end the span with ERROR status and `error.type`.
 - `rootApiPath` uses a segment boundary check (`/apiary` is no longer traced).
-- Requires `@devopsplaybook.io/otel-utils` `^1.3.0` (uses `StandardTracer.startSpan(name, parentSpan?, options?)`).
+- Introduced the `@devopsplaybook.io/otel-utils` peer requirement for `StandardTracer.startSpan(name, parentSpan?, options?)` (the current peer range is in [Installation](#installation)).
 
 ## Dependencies
 
-| Package                               | Type       | Purpose                                     |
-| ------------------------------------- | ---------- | ------------------------------------------- |
-| `@devopsplaybook.io/otel-utils`       | peer       | StandardTracer and StandardLogger instances |
-| `fastify`                             | peer       | Fastify web framework (v5)                  |
-| `@opentelemetry/api`                  | dependency | Context management, span status codes       |
-| `@opentelemetry/core`                 | dependency | W3C trace context propagator                |
-| `@opentelemetry/sdk-trace-base`       | dependency | Span type                                   |
-| `@opentelemetry/semantic-conventions` | dependency | HTTP semantic attribute constants           |
+| Package                               | Type       | Purpose                                                    |
+| ------------------------------------- | ---------- | ---------------------------------------------------------- |
+| `@devopsplaybook.io/otel-utils`       | peer       | StandardTracer, StandardMeter and StandardLogger instances |
+| `fastify`                             | peer       | Fastify web framework (v5)                                 |
+| `@opentelemetry/api`                  | dependency | Context, span kind/status and histogram types              |
+| `@opentelemetry/core`                 | dependency | W3C trace context propagator                               |
+| `@opentelemetry/sdk-trace`            | dependency | `Span` type used by the hooks                              |
+| `@opentelemetry/semantic-conventions` | dependency | HTTP semantic attribute and metric-name constants          |
 
 ## Build, lint, test
 
