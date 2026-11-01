@@ -1220,6 +1220,17 @@ describe("standardMeter option", () => {
 
     expect(meter.createHistogram).toHaveBeenCalledWith(
       "http.server.request.duration",
+      {
+        unit: "s",
+        description: "Duration of HTTP server requests.",
+        advice: {
+          explicitBucketBoundaries: [
+            0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5,
+            7.5, 10,
+          ],
+        },
+        unprefixed: false,
+      },
     );
     expect(meter.histogram.record).toHaveBeenCalledTimes(1);
     const [value, attributes] = meter.histogram.record.mock.calls[0];
@@ -1368,6 +1379,159 @@ describe("standardMeter option", () => {
     } finally {
       await app.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Histogram options
+// ---------------------------------------------------------------------------
+
+describe("histogram options", () => {
+  const SEMCONV_BOUNDARIES = [
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10,
+  ];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test("uses the semconv unit, description and boundaries by default", async () => {
+    const meter = createMockMeter();
+    const { app } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      standardMeter: meter as any,
+    });
+
+    expect(meter.createHistogram).toHaveBeenCalledTimes(1);
+    expect(meter.createHistogram).toHaveBeenCalledWith(
+      "http.server.request.duration",
+      {
+        unit: "s",
+        description: "Duration of HTTP server requests.",
+        advice: { explicitBucketBoundaries: SEMCONV_BOUNDARIES },
+        unprefixed: false,
+      },
+    );
+    await app.close();
+  });
+
+  test("unprefixedMetricName: true forwards unprefixed: true", async () => {
+    const meter = createMockMeter();
+    const { app } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      standardMeter: meter as any,
+      unprefixedMetricName: true,
+    });
+
+    expect(meter.createHistogram).toHaveBeenCalledWith(
+      "http.server.request.duration",
+      expect.objectContaining({ unprefixed: true }),
+    );
+    await app.close();
+  });
+
+  test("unprefixedMetricName: false keeps the prefixed default", async () => {
+    const meter = createMockMeter();
+    const { app } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      standardMeter: meter as any,
+      unprefixedMetricName: false,
+    });
+
+    expect(meter.createHistogram).toHaveBeenCalledWith(
+      "http.server.request.duration",
+      expect.objectContaining({ unprefixed: false }),
+    );
+    await app.close();
+  });
+
+  test("forwards custom boundaries verbatim in a fresh array", async () => {
+    const meter = createMockMeter();
+    const customBoundaries = [0.001, 0.01, 0.1, 1, 10];
+    const { app } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      standardMeter: meter as any,
+      histogramOptions: { explicitBucketBoundaries: customBoundaries },
+    });
+
+    const [, histogramOptions] = meter.createHistogram.mock.calls[0];
+    expect(histogramOptions.advice.explicitBucketBoundaries).toEqual(
+      customBoundaries,
+    );
+    expect(histogramOptions.advice.explicitBucketBoundaries).not.toBe(
+      customBoundaries,
+    );
+    expect(histogramOptions.unit).toBe("s");
+    expect(histogramOptions.description).toBe(
+      "Duration of HTTP server requests.",
+    );
+    await app.close();
+  });
+
+  test("forwards a custom unit and description", async () => {
+    const meter = createMockMeter();
+    const { app } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      standardMeter: meter as any,
+      histogramOptions: { unit: "ms", description: "custom description" },
+    });
+
+    expect(meter.createHistogram).toHaveBeenCalledWith(
+      "http.server.request.duration",
+      {
+        unit: "ms",
+        description: "custom description",
+        advice: { explicitBucketBoundaries: SEMCONV_BOUNDARIES },
+        unprefixed: false,
+      },
+    );
+    await app.close();
+  });
+
+  test("creates the histogram once per registration, not per request", async () => {
+    const meter = createMockMeter();
+    const { app } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      standardMeter: meter as any,
+    });
+
+    await app.inject({ method: "GET", url: "/api/test" });
+    await app.inject({ method: "GET", url: "/api/test" });
+
+    expect(meter.createHistogram).toHaveBeenCalledTimes(1);
+    expect(meter.histogram.record).toHaveBeenCalledTimes(2);
+    await app.close();
+  });
+
+  test("custom boundaries do not change span behaviour", async () => {
+    const meter = createMockMeter();
+    const { app, mockSpan } = buildApp({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      standardMeter: meter as any,
+      histogramOptions: { explicitBucketBoundaries: [0.001, 0.01, 0.1, 1, 10] },
+    });
+
+    await app.inject({ method: "GET", url: "/api/test" });
+
+    expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+      "http.response.status_code",
+      200,
+    );
+    expect(mockSpan.end).toHaveBeenCalledTimes(1);
+    expect(meter.histogram.record).toHaveBeenCalledTimes(1);
+    await app.close();
+  });
+
+  test("histogramOptions without standardMeter is a no-op", async () => {
+    const { app } = buildApp({
+      histogramOptions: { explicitBucketBoundaries: [0.001, 1] },
+      unprefixedMetricName: true,
+    });
+
+    const res = await app.inject({ method: "GET", url: "/api/test" });
+
+    expect(res.statusCode).toBe(200);
+    await app.close();
   });
 });
 
