@@ -1,6 +1,6 @@
 {
   "name": "@devopsplaybook.io/otel-utils-fastify",
-  "version": "1.11.3",
+  "version": "1.11.4",
   "description": "Utility to simplify integration with Open Telemetry for Fastify API Server",
   "keywords": [
     "Open Telemetry",
@@ -37,7 +37,7 @@
     "test": "jest --coverage"
   },
   "peerDependencies": {
-    "@devopsplaybook.io/otel-utils": "^1.14.3",
+    "@devopsplaybook.io/otel-utils": "^1.14.5",
     "fastify": "^5.0.0"
   },
   "dependencies": {
@@ -47,16 +47,16 @@
     "@opentelemetry/semantic-conventions": "^1.45.0"
   },
   "devDependencies": {
-    "@devopsplaybook.io/otel-utils": "^1.14.3",
+    "@devopsplaybook.io/otel-utils": "^1.14.5",
     "@opentelemetry/context-async-hooks": "^3.1.1",
     "@opentelemetry/sdk-metrics": "^3.1.1",
     "@swc/core": "^1.16.22",
     "@swc/jest": "^0.2.39",
     "@types/jest": "^30.0.0",
-    "@types/node": "^26.6.6",
+    "@types/node": "^26.6.11",
     "fastify": "^5.12.8",
     "jest": "^30.5.2",
-    "oxlint": "^1.94.0",
+    "oxlint": "^1.95.0",
     "prettier": "^3.10.1",
     "typescript": "^7.0.2"
   },
